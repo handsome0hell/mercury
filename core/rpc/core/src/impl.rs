@@ -6,45 +6,48 @@ mod query;
 pub(crate) mod utils;
 pub(crate) mod utils_types;
 
-use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     CrossChainTransferPayload, InitChainPayload, InitChainResponse, IssueAssetPayload,
     SubmitCheckpointPayload,
 };
-use core_rpc_types::{
-    indexer, AdjustAccountPayload, BlockInfo, DaoClaimPayload, DaoDepositPayload,
-    DaoWithdrawPayload, GetBalancePayload, GetBalanceResponse, GetBlockInfoPayload,
-    GetSpentTransactionPayload, GetTransactionInfoResponse, MercuryInfo, QueryTransactionsPayload,
-    SimpleTransferPayload, SudtIssuePayload, SyncState, TransactionCompletionResponse,
-    TransferPayload, TxView,
-};
 
 use crate::r#impl::build_tx::calculate_tx_size;
-use crate::{error::CoreError, MercuryRpcServer, RpcResult};
-
-use common::utils::{parse_address, ScriptInfo};
-use common::{
-    async_trait, hash::blake2b_160, AddressPayload, Context, NetworkType, PaginationResponse, ACP,
-    CHEQUE, DAO, SECP256K1, SUDT,
-};
-use core_rpc_types::error::MercuryRpcError;
-use core_rpc_types::lazy::{
-    ACP_CODE_HASH, CHEQUE_CODE_HASH, DAO_CODE_HASH, SECP256K1_CODE_HASH, SUDT_CODE_HASH,
-};
-use core_storage::{DBInfo, RelationalStorage};
+use crate::{error::CoreError, MercuryRpcServer};
 
 use ckb_jsonrpc_types::Uint64;
 use ckb_types::core::RationalU256;
-use ckb_types::{bytes::Bytes, packed, prelude::*, H160, H256};
+use ckb_types::{packed, prelude::*, H160, H256};
 use clap::crate_version;
-use dashmap::DashMap;
+use common::lazy::{
+    ACP_CODE_HASH, CHEQUE_CODE_HASH, DAO_CODE_HASH, PW_LOCK_CODE_HASH, SECP256K1_CODE_HASH,
+    SUDT_CODE_HASH,
+};
+use common::utils::ScriptInfo;
+use common::{
+    async_trait, hash::blake2b_160, Address, AddressPayload, Context, NetworkType, Order, ACP,
+    CHEQUE, DAO, PW_LOCK, SECP256K1, SUDT,
+};
+use core_ckb_client::CkbRpc;
+use core_rpc_types::error::MercuryRpcError;
+use core_rpc_types::{
+    indexer, AdjustAccountPayload, BlockInfo, DaoClaimPayload, DaoDepositPayload,
+    DaoWithdrawPayload, GetAccountInfoPayload, GetAccountInfoResponse, GetBalancePayload,
+    GetBalanceResponse, GetBlockInfoPayload, GetSpentTransactionPayload,
+    GetTransactionInfoResponse, MercuryInfo, PaginationResponse, QueryTransactionsPayload,
+    SimpleTransferPayload, SudtIssuePayload, SyncState, TransactionCompletionResponse,
+    TransferPayload, TxView,
+};
+use core_storage::{DBInfo, RelationalStorage};
+use jsonrpsee_core::{Error, RpcResult};
 use parking_lot::RwLock;
+use pprof::ProfilerGuard;
 
 use std::collections::HashMap;
-use std::{sync::Arc, thread::ThreadId};
+use std::str::FromStr;
+use std::sync::Arc;
 
 lazy_static::lazy_static! {
-    pub static ref ACP_USED_CACHE: DashMap<ThreadId, Vec<packed::OutPoint>> = DashMap::new();
+    pub static ref PROFILER_GUARD: std::sync::Mutex<Option<ProfilerGuard<'static>>> = std::sync::Mutex::new(None);
 }
 
 macro_rules! rpc_impl {
@@ -68,6 +71,7 @@ pub struct MercuryRpcImpl<C> {
     cellbase_maturity: RationalU256,
     sync_state: Arc<RwLock<SyncState>>,
     pool_cache_size: u64,
+    is_pprof_enabled: bool,
 }
 
 #[async_trait]
@@ -89,6 +93,13 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         payload: QueryTransactionsPayload,
     ) -> RpcResult<PaginationResponse<TxView>> {
         rpc_impl!(self, inner_query_transactions, payload)
+    }
+
+    async fn get_account_info(
+        &self,
+        payload: GetAccountInfoPayload,
+    ) -> RpcResult<GetAccountInfoResponse> {
+        rpc_impl!(self, inner_get_account_info, payload)
     }
 
     async fn build_adjust_account_transaction(
@@ -143,8 +154,8 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
     async fn register_addresses(&self, addresses: Vec<String>) -> RpcResult<Vec<H160>> {
         let mut inputs: Vec<(H160, String)> = vec![];
         for addr_str in addresses {
-            let address = parse_address(&addr_str)
-                .map_err(|e| MercuryRpcError::from(CoreError::CommonError(e.to_string())))?;
+            let address = Address::from_str(&addr_str)
+                .map_err(|e| MercuryRpcError::from(CoreError::ParseAddressError(e)))?;
             let lock = address_to_script(address.payload());
             let lock_hash = H160(blake2b_160(lock.as_slice()));
             inputs.push((lock_hash, addr_str));
@@ -153,11 +164,11 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         rpc_impl!(self, inner_register_addresses, inputs)
     }
 
-    fn get_mercury_info(&self) -> RpcResult<MercuryInfo> {
+    async fn get_mercury_info(&self) -> RpcResult<MercuryInfo> {
         Ok(MercuryInfo {
             network_type: self.network_type,
             mercury_version: crate_version!().to_string(),
-            ckb_node_version: "v0.101".to_string(),
+            ckb_node_version: self.ckb_client.local_node_info().await?.version,
             enabled_extensions: vec![],
         })
     }
@@ -208,13 +219,19 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
     async fn get_cells(
         &self,
         search_key: indexer::SearchKey,
-        order: indexer::Order,
+        order: Order,
         limit: Uint64,
-        after_cursor: Option<Bytes>,
+        after_cursor: Option<Uint64>,
     ) -> RpcResult<indexer::PaginationResponse<indexer::Cell>> {
-        self.inner_get_cells(Context::new(), search_key, order, limit, after_cursor)
-            .await
-            .map_err(Into::into)
+        self.inner_get_cells(
+            Context::new(),
+            search_key,
+            order,
+            limit.into(),
+            after_cursor.map(Into::into),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn get_cells_capacity(
@@ -229,13 +246,19 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
     async fn get_transactions(
         &self,
         search_key: indexer::SearchKey,
-        order: indexer::Order,
+        order: Order,
         limit: Uint64,
-        after_cursor: Option<Bytes>,
+        after_cursor: Option<Uint64>,
     ) -> RpcResult<indexer::PaginationResponse<indexer::Transaction>> {
-        self.inner_get_transaction(Context::new(), search_key, order, limit, after_cursor)
-            .await
-            .map_err(Into::into)
+        self.inner_get_transaction(
+            Context::new(),
+            search_key,
+            order,
+            limit.into(),
+            after_cursor.map(Into::into),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn get_ckb_uri(&self) -> RpcResult<Vec<String>> {
@@ -260,8 +283,8 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         self.inner_get_live_cells_by_lock_hash(
             Context::new(),
             lock_hash,
-            page,
-            per_page,
+            page.into(),
+            per_page.into(),
             reverse_order,
         )
         .await
@@ -287,8 +310,8 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         self.inner_get_transactions_by_lock_hash(
             Context::new(),
             lock_hash,
-            page,
-            per_page,
+            page.into(),
+            per_page.into(),
             reverse_order,
         )
         .await
@@ -299,6 +322,40 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         self.inner_get_sync_state(Context::new())
             .await
             .map_err(Into::into)
+    }
+
+    async fn start_profiler(&self) -> RpcResult<()> {
+        if !self.is_pprof_enabled {
+            return Err(Error::MethodNotFound("start_profiler".to_string()));
+        }
+        log::info!("profiler started");
+        let profiler_guard = ProfilerGuard::new(100).map_err(|e| Error::Custom(e.to_string()))?;
+        let mut lock = PROFILER_GUARD
+            .try_lock()
+            .map_err(|e| Error::Custom(e.to_string()))?;
+        *lock = Some(profiler_guard);
+        Ok(())
+    }
+
+    async fn report_pprof(&self) -> RpcResult<()> {
+        if !self.is_pprof_enabled {
+            return Err(Error::MethodNotFound("report_pprof".to_string()));
+        }
+        log::info!("profiler started");
+        let mut profiler = PROFILER_GUARD
+            .try_lock()
+            .map_err(|e| Error::Custom(e.to_string()))?;
+        if let Some(profiler) = profiler.take() {
+            if let Ok(report) = profiler.report().build() {
+                let file = std::fs::File::create("./free-space/flamegraph.svg")?;
+                let mut options = pprof::flamegraph::Options::default();
+                options.image_width = Some(2500);
+                report
+                    .flamegraph_with_options(file, &mut options)
+                    .map_err(|e| Error::Custom(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -312,53 +369,9 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         cellbase_maturity: RationalU256,
         sync_state: Arc<RwLock<SyncState>>,
         pool_cache_size: u64,
+        is_pprof_enabled: bool,
     ) -> Self {
-        SECP256K1_CODE_HASH.swap(Arc::new(
-            builtin_scripts
-                .get(SECP256K1)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        SUDT_CODE_HASH.swap(Arc::new(
-            builtin_scripts
-                .get(SUDT)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        ACP_CODE_HASH.swap(Arc::new(
-            builtin_scripts
-                .get(ACP)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        CHEQUE_CODE_HASH.swap(Arc::new(
-            builtin_scripts
-                .get(CHEQUE)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        DAO_CODE_HASH.swap(Arc::new(
-            builtin_scripts
-                .get(DAO)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-
+        load_code_hash(&builtin_scripts);
         MercuryRpcImpl {
             storage,
             builtin_scripts,
@@ -368,10 +381,68 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             cellbase_maturity,
             sync_state,
             pool_cache_size,
+            is_pprof_enabled,
         }
     }
 }
 
 pub fn address_to_script(payload: &AddressPayload) -> packed::Script {
     payload.into()
+}
+
+pub fn load_code_hash(builtin_scripts: &HashMap<String, ScriptInfo>) {
+    let _ = SECP256K1_CODE_HASH.set(
+        builtin_scripts
+            .get(SECP256K1)
+            .cloned()
+            .expect("get secp256k1 code hash")
+            .script
+            .code_hash()
+            .unpack(),
+    );
+    let _ = SUDT_CODE_HASH.set(
+        builtin_scripts
+            .get(SUDT)
+            .cloned()
+            .expect("get sudt code hash")
+            .script
+            .code_hash()
+            .unpack(),
+    );
+    let _ = ACP_CODE_HASH.set(
+        builtin_scripts
+            .get(ACP)
+            .cloned()
+            .expect("get acp code hash")
+            .script
+            .code_hash()
+            .unpack(),
+    );
+    let _ = CHEQUE_CODE_HASH.set(
+        builtin_scripts
+            .get(CHEQUE)
+            .cloned()
+            .expect("get cheque code hash")
+            .script
+            .code_hash()
+            .unpack(),
+    );
+    let _ = DAO_CODE_HASH.set(
+        builtin_scripts
+            .get(DAO)
+            .cloned()
+            .expect("get dao code hash")
+            .script
+            .code_hash()
+            .unpack(),
+    );
+    let _ = PW_LOCK_CODE_HASH.set(
+        builtin_scripts
+            .get(PW_LOCK)
+            .cloned()
+            .expect("get pw lock code hash")
+            .script
+            .code_hash()
+            .unpack(),
+    );
 }

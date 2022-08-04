@@ -1,5 +1,6 @@
 pub mod address;
 pub mod hash;
+pub mod lazy;
 pub mod utils;
 
 pub use address::{Address, AddressPayload, AddressType, CodeHashIndex};
@@ -11,8 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use std::fmt::{self, Debug, Display};
 
-pub const SIGHASH_TYPE_HASH: H256 =
-    h256!("0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8");
 pub const MULTISIG_TYPE_HASH: H256 =
     h256!("0x5c5069eb0857efc65e1bca0c07df34c31663b3622fd3876c876320fc9634e2a8");
 pub const DAO_TYPE_HASH: H256 =
@@ -23,17 +22,20 @@ pub const ACP_TESTNET_TYPE_HASH: H256 =
     h256!("0x3419a1c09eb2567f6552ee7a8ecffd64155cffe0f1796e6e61ec088d740c1356");
 pub const TYPE_ID_CODE_HASH: H256 =
     h256!("0x00000000000000000000000000000000000000000000000000545950455f4944");
+
 pub const PREFIX_MAINNET: &str = "ckb";
 pub const PREFIX_TESTNET: &str = "ckt";
 pub const NETWORK_MAINNET: &str = "ckb";
 pub const NETWORK_TESTNET: &str = "ckb_testnet";
 pub const NETWORK_STAGING: &str = "ckb_staging";
 pub const NETWORK_DEV: &str = "ckb_dev";
+
 pub const SECP256K1: &str = "secp256k1_blake160";
 pub const SUDT: &str = "sudt";
 pub const ACP: &str = "anyone_can_pay";
 pub const CHEQUE: &str = "cheque";
 pub const DAO: &str = "dao";
+pub const PW_LOCK: &str = "pw_lock";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ErrorKind {
@@ -90,9 +92,10 @@ impl<T: Debug + Display> MercuryError<T> {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum Order {
+    #[serde(alias = "asc")]
     Asc,
+    #[serde(alias = "desc")]
     Desc,
 }
 
@@ -173,7 +176,7 @@ impl Range {
     }
 
     pub fn is_in(&self, num: u64) -> bool {
-        self.from <= num && num <= self.to
+        num >= self.from && num <= self.to
     }
 
     pub fn min(&self) -> u64 {
@@ -187,7 +190,7 @@ impl Range {
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PaginationRequest {
-    pub cursor: Option<Bytes>,
+    pub cursor: Option<u64>,
     pub order: Order,
     pub limit: Option<u64>,
     pub skip: Option<u64>,
@@ -196,7 +199,7 @@ pub struct PaginationRequest {
 
 impl PaginationRequest {
     pub fn new(
-        cursor: Option<Bytes>,
+        cursor: Option<u64>,
         order: Order,
         limit: Option<u64>,
         skip: Option<u64>,
@@ -229,15 +232,15 @@ impl PaginationRequest {
         self.limit = limit;
     }
 
-    pub fn update_by_response<T>(&mut self, response: PaginationResponse<T>) {
-        self.cursor = response.next_cursor;
+    pub fn update_by_response(&mut self, next_cursor: Option<u64>) {
+        self.cursor = next_cursor;
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PaginationResponse<T> {
     pub response: Vec<T>,
-    pub next_cursor: Option<Bytes>,
+    pub next_cursor: Option<u64>,
     pub count: Option<u64>,
 }
 

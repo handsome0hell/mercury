@@ -1,11 +1,12 @@
 use super::*;
-use crate::r#impl::utils::{self};
+use crate::r#impl::utils::{self, calculate_cell_capacity};
+use ckb_jsonrpc_types::OutPoint;
 use core_rpc_types::{JsonItem, SinceConfig, SinceFlag, SinceType};
 
 use ckb_types::core::EpochNumberWithFraction;
 
-#[tokio::test]
-async fn test_is_dao_withdraw_unlock() {
+#[test]
+fn test_is_dao_withdraw_unlock() {
     let deposit_epoch = RationalU256::from_u256(0u64.into());
     let withdraw_epoch = RationalU256::from_u256(100u64.into());
     let tip_epoch = RationalU256::from_u256(180u64.into());
@@ -69,8 +70,8 @@ async fn test_is_dao_withdraw_unlock() {
     assert!(res);
 }
 
-#[tokio::test]
-async fn test_calculate_unlock_epoch_number() {
+#[test]
+fn test_calculate_unlock_epoch_number() {
     let deposit_epoch = EpochNumberWithFraction::new(2, 648, 1677);
     let withdraw_epoch = EpochNumberWithFraction::new(47, 382, 1605);
     let unlock_epoch_number = utils::calculate_unlock_epoch_number(
@@ -94,8 +95,8 @@ async fn test_calculate_unlock_epoch_number() {
     );
 }
 
-#[tokio::test]
-async fn test_epoch_number_into_u256() {
+#[test]
+fn test_epoch_number_into_u256() {
     let epoch = EpochNumberWithFraction::new(2, 648, 1677).to_rational();
     let epoch_rebuild = RationalU256::from_u256(epoch.clone().into_u256());
     assert_ne!(epoch, epoch_rebuild);
@@ -105,8 +106,8 @@ async fn test_epoch_number_into_u256() {
     assert_eq!(epoch_number_rational_u256, epoch_number.to_rational());
 }
 
-#[tokio::test]
-async fn test_to_since() {
+#[test]
+fn test_to_since() {
     let deposit_epoch = EpochNumberWithFraction::new(2, 648, 1677);
     let withdraw_epoch = EpochNumberWithFraction::new(47, 382, 1605);
     let unlock_epoch_number = utils::calculate_unlock_epoch_number(
@@ -117,63 +118,79 @@ async fn test_to_since() {
     let since = utils::to_since(SinceConfig {
         type_: SinceType::EpochNumber,
         flag: SinceFlag::Absolute,
-        value: unlock_epoch_number,
+        value: unlock_epoch_number.into(),
     });
     assert_eq!(0x20068d02880000b6u64, since.unwrap());
 }
 
-#[tokio::test]
-async fn test_check_same_enum_value() {
-    let items = vec![];
-    let ret = utils::check_same_enum_value(&items);
-    assert!(ret.is_ok());
+#[test]
+fn test_dedup_items() {
+    let a1 = JsonItem::Identity("abc".to_string());
+    let b1 = JsonItem::Identity("bcd".to_string());
+    let c1 = JsonItem::OutPoint(OutPoint {
+        index: 0.into(),
+        tx_hash: H256::from_str("365698b50ca0da75dca2c87f9e7b563811d3b5813736b8cc62cc3b106faceb17")
+            .unwrap(),
+    });
+    let c2 = JsonItem::OutPoint(OutPoint {
+        index: 1.into(),
+        tx_hash: H256::from_str("365698b50ca0da75dca2c87f9e7b563811d3b5813736b8cc62cc3b106faceb17")
+            .unwrap(),
+    });
+    let c3 = JsonItem::OutPoint(OutPoint {
+        index: 1.into(),
+        tx_hash: H256::from_str("365698b50ca0da75dca2c87f9e7b563811d3b5813736b8cc62cc3b106faceb17")
+            .unwrap(),
+    });
+    let b2 = JsonItem::Identity("bcd".to_string());
 
-    let a = JsonItem::Identity("abc".to_string());
-    let items = vec![a];
-    let ret = utils::check_same_enum_value(&items);
-    assert!(ret.is_ok());
-
-    let a = JsonItem::Identity("bcd".to_string());
-    let b = JsonItem::Identity("abc".to_string());
-    let items = vec![a, b];
-    let ret = utils::check_same_enum_value(&items);
-    assert!(ret.is_ok());
-
-    let a = JsonItem::Identity("abc".to_string());
-    let b = JsonItem::Address("bcd".to_string());
-    let items = vec![a, b];
-    let ret = utils::check_same_enum_value(&items);
-    assert!(ret.is_err());
-
-    let a = JsonItem::Identity("abc".to_string());
-    let b = JsonItem::Address("bcd".to_string());
-    let c = JsonItem::Record("cde".to_string());
-    let items = vec![a, b, c];
-    let ret = utils::check_same_enum_value(&items);
-    assert!(ret.is_err());
-}
-
-#[tokio::test]
-async fn test_dedup_items() {
-    let a = JsonItem::Identity("bcd".to_string());
-    let b = JsonItem::Identity("bcd".to_string());
-    let c = JsonItem::Identity("abc".to_string());
-    let e = JsonItem::Identity("bcd".to_string());
-
-    let items = vec![a, b, c, e];
-    let items = utils::dedup_json_items(items);
+    let mut items = vec![a1, b1, c1, c2, c3, b2];
+    utils::dedup_json_items(&mut items);
 
     assert_eq!(
         vec![
             JsonItem::Identity("abc".to_string()),
-            JsonItem::Identity("bcd".to_string())
+            JsonItem::Identity("bcd".to_string()),
+            JsonItem::OutPoint(OutPoint {
+                index: 0.into(),
+                tx_hash: H256::from_str(
+                    "365698b50ca0da75dca2c87f9e7b563811d3b5813736b8cc62cc3b106faceb17"
+                )
+                .unwrap(),
+            }),
+            JsonItem::OutPoint(OutPoint {
+                index: 1.into(),
+                tx_hash: H256::from_str(
+                    "365698b50ca0da75dca2c87f9e7b563811d3b5813736b8cc62cc3b106faceb17"
+                )
+                .unwrap(),
+            })
         ],
         items
     );
 }
 
-#[tokio::test]
-async fn test_calculate_the_percentage() {
+#[test]
+fn test_dedup_items_identity() {
+    let a = JsonItem::Identity("bcd".to_string());
+    let b = JsonItem::Identity("bcd".to_string());
+    let c = JsonItem::Identity("abc".to_string());
+    let e = JsonItem::Identity("bcd".to_string());
+
+    let mut items = vec![a, b, c, e];
+    utils::dedup_json_items(&mut items);
+
+    assert_eq!(
+        vec![
+            JsonItem::Identity("bcd".to_string()),
+            JsonItem::Identity("abc".to_string()),
+        ],
+        items
+    );
+}
+
+#[test]
+fn test_calculate_the_percentage() {
     assert_eq!(
         "0.00000%".to_string(),
         utils::calculate_the_percentage(0, 0)
@@ -226,4 +243,15 @@ async fn test_calculate_the_percentage() {
         "150.00000%".to_string(),
         utils::calculate_the_percentage(3, 2)
     );
+}
+
+#[test]
+fn test_calculate_cell_capacity() {
+    let address = Address::from_str("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq4nnw7qkdnnclfkg59uzn8umtfd2kwxceqcydzyt").unwrap();
+    let capacity = calculate_cell_capacity(
+        &address_to_script(address.payload()),
+        &packed::ScriptOpt::default(),
+        Capacity::bytes(0).expect("generate capacity"),
+    );
+    assert_eq!(6100000000, capacity);
 }

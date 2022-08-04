@@ -2,30 +2,33 @@
 
 mod operation_test;
 mod query_test;
-// mod transfer_completion_test;
 mod rpc_test;
 mod sqlite;
 mod utils_test;
 
-use crate::{r#impl::address_to_script, MercuryRpcImpl, MercuryRpcServer};
+use crate::{
+    r#impl::{address_to_script, load_code_hash},
+    MercuryRpcImpl, MercuryRpcServer,
+};
 
+use common::lazy::{
+    ACP_CODE_HASH, CHEQUE_CODE_HASH, DAO_CODE_HASH, PW_LOCK_CODE_HASH, SECP256K1_CODE_HASH,
+    SUDT_CODE_HASH,
+};
 use common::utils::{decode_udt_amount, parse_address, ScriptInfo};
 use common::{
     async_trait, hash::blake2b_160, Address, AddressPayload, Context, NetworkType, Result, ACP,
-    CHEQUE, DAO, SECP256K1, SUDT,
+    CHEQUE, DAO, PW_LOCK, SECP256K1, SUDT,
 };
 use core_ckb_client::CkbRpcClient;
 use core_cli::config::{parse, MercuryConfig};
 use core_rpc_types::consts::{BYTE_SHANNONS, CHEQUE_CELL_CAPACITY, STANDARD_SUDT_CAPACITY};
-use core_rpc_types::lazy::{
-    ACP_CODE_HASH, CHEQUE_CODE_HASH, DAO_CODE_HASH, SECP256K1_CODE_HASH, SUDT_CODE_HASH,
-};
 use core_rpc_types::{
-    AdjustAccountPayload, AdvanceQueryPayload, BlockInfo, DaoDepositPayload, DaoWithdrawPayload,
-    GetBalancePayload, GetBalanceResponse, GetBlockInfoPayload, GetSpentTransactionPayload,
-    GetTransactionInfoResponse, MercuryInfo, QueryResponse, QueryTransactionsPayload,
-    SimpleTransferPayload, StructureType, SyncState, TransactionCompletionResponse,
-    TransactionStatus, TransferPayload, TxView,
+    AdjustAccountPayload, BlockInfo, DaoDepositPayload, DaoWithdrawPayload, GetBalancePayload,
+    GetBalanceResponse, GetBlockInfoPayload, GetSpentTransactionPayload,
+    GetTransactionInfoResponse, MercuryInfo, QueryTransactionsPayload, SimpleTransferPayload,
+    StructureType, SyncState, TransactionCompletionResponse, TransactionStatus, TransferPayload,
+    TxView,
 };
 use core_storage::{DBDriver, RelationalStorage, Storage};
 
@@ -41,8 +44,9 @@ use rand::random;
 use std::collections::{HashMap, HashSet};
 use std::{str::FromStr, sync::Arc};
 
-const CONFIG_PATH: &str = "../../../devtools/config/testnet_config.toml";
+const CONFIG_PATH: &str = "../../../integration/dev_chain/devnet_config.toml";
 const MAINNET_CONFIG: &str = "../../../devtools/config/mainnet_config.toml";
+const TESTNET_CONFIG: &str = "../../../devtools/config/testnet_config.toml";
 const OUTPUT_FILE: &str = "../../../free-space/output.json";
 const NETWORK_TYPE: NetworkType = NetworkType::Testnet;
 const MEMORY_DB: &str = ":memory:";
@@ -96,7 +100,7 @@ impl RpcTestEngine {
         let mut tx = store.pool.transaction().await.unwrap();
         sqlite::create_tables(&mut tx).await.unwrap();
 
-        let config: MercuryConfig = parse(CONFIG_PATH).unwrap();
+        let config: MercuryConfig = parse(TESTNET_CONFIG).unwrap();
         let script_map = config.to_script_map();
 
         let sudt_script = script_map
@@ -124,17 +128,19 @@ impl RpcTestEngine {
         store
             .connect(
                 DBDriver::PostgreSQL,
-                "mercury",
+                "mercury-dev",
                 url,
-                8432,
+                5432,
                 "postgres",
-                "123456",
+                "123456789",
             )
             .await
             .unwrap();
 
         let path = if net_ty == NetworkType::Mainnet {
             MAINNET_CONFIG
+        } else if net_ty == NetworkType::Testnet {
+            TESTNET_CONFIG
         } else {
             CONFIG_PATH
         };
@@ -142,51 +148,7 @@ impl RpcTestEngine {
         let config: MercuryConfig = parse(path).unwrap();
         let script_map = config.to_script_map();
 
-        SECP256K1_CODE_HASH.swap(Arc::new(
-            script_map
-                .get(SECP256K1)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        ACP_CODE_HASH.swap(Arc::new(
-            script_map
-                .get(ACP)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        CHEQUE_CODE_HASH.swap(Arc::new(
-            script_map
-                .get(CHEQUE)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        DAO_CODE_HASH.swap(Arc::new(
-            script_map
-                .get(DAO)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
-        SUDT_CODE_HASH.swap(Arc::new(
-            script_map
-                .get(SUDT)
-                .cloned()
-                .unwrap()
-                .script
-                .code_hash()
-                .unpack(),
-        ));
+        load_code_hash(&script_map);
 
         let sudt_script = script_map
             .get(SUDT)
@@ -347,6 +309,7 @@ impl RpcTestEngine {
             RationalU256::from_u256(6u64.into()),
             Arc::new(RwLock::new(SyncState::ReadOnly)),
             100u64,
+            true,
         )
     }
 

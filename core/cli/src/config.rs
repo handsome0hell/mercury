@@ -119,6 +119,9 @@ pub struct MercuryConfig {
 
     #[serde(default = "default_pool_cache_size")]
     pub pool_cache_size: u64,
+
+    #[serde(default = "default_is_pprof_enabled")]
+    pub is_pprof_enabled: bool,
 }
 
 impl MercuryConfig {
@@ -134,8 +137,12 @@ impl MercuryConfig {
                 (
                     s.script_name.clone(),
                     ScriptInfo {
-                        script: serde_json::from_str::<Script>(&s.script).unwrap().into(),
-                        cell_dep: serde_json::from_str::<CellDep>(&s.cell_dep).unwrap().into(),
+                        script: serde_json::from_str::<Script>(&s.script)
+                            .expect("config string to script")
+                            .into(),
+                        cell_dep: serde_json::from_str::<CellDep>(&s.cell_dep)
+                            .expect("config string to cell dep")
+                            .into(),
                     },
                 )
             })
@@ -210,6 +217,10 @@ fn default_extensions_config() -> Vec<ExtensionConfig> {
 
 fn default_pool_cache_size() -> u64 {
     100u64
+}
+
+fn default_is_pprof_enabled() -> bool {
+    false
 }
 
 fn default_file_size_limit() -> u64 {

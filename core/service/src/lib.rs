@@ -1,20 +1,15 @@
 #![allow(clippy::mutable_key_type, dead_code)]
 
-mod middleware;
-
-// use middleware::{CkbRelayMiddleware, RelayMetadata};
-
+use ckb_jsonrpc_types::{RawTxPool, TransactionWithStatus};
+use ckb_types::core::{BlockNumber, BlockView, EpochNumberWithFraction, RationalU256};
+use ckb_types::{packed, H256};
 use common::{anyhow::anyhow, utils::ScriptInfo, Context, NetworkType, Result};
 use core_ckb_client::{CkbRpc, CkbRpcClient};
 use core_rpc::{MercuryRpcImpl, MercuryRpcServer};
 use core_rpc_types::lazy::{CURRENT_BLOCK_NUMBER, CURRENT_EPOCH_NUMBER, TX_POOL_CACHE};
 use core_rpc_types::{SyncProgress, SyncState};
 use core_storage::{DBDriver, RelationalStorage, Storage};
-use core_synchronization::Synchronization;
-
-use ckb_jsonrpc_types::{RawTxPool, TransactionWithStatus};
-use ckb_types::core::{BlockNumber, BlockView, EpochNumberWithFraction, RationalU256};
-use ckb_types::{packed, H256};
+use core_synchronization::{Synchronization, TASK_LEN};
 use jsonrpsee_http_server::{HttpServerBuilder, HttpServerHandle};
 use log::{error, info, warn, LevelFilter};
 use parking_lot::RwLock;
@@ -24,8 +19,6 @@ use std::collections::{HashMap, HashSet};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Instant;
-
-const GENESIS_NUMBER: u64 = 0;
 
 #[derive(Clone, Debug)]
 pub struct Service {
@@ -40,6 +33,7 @@ pub struct Service {
     use_tx_pool_cache: bool,
     sync_state: Arc<RwLock<SyncState>>,
     pool_cache_size: u64,
+    is_pprof_enabled: bool,
 }
 
 impl Service {
@@ -62,6 +56,7 @@ impl Service {
         cheque_since: u64,
         log_level: LevelFilter,
         pool_cache_size: u64,
+        is_pprof_enabled: bool,
     ) -> Self {
         let ckb_client = CkbRpcClient::new(ckb_uri);
         let store = RelationalStorage::new(
@@ -93,6 +88,7 @@ impl Service {
             use_tx_pool_cache,
             sync_state,
             pool_cache_size,
+            is_pprof_enabled,
         }
     }
 
@@ -116,9 +112,10 @@ impl Service {
                 &password,
             )
             .await
-            .unwrap();
+            .expect("connect database");
 
         let server = HttpServerBuilder::default()
+            .max_response_body_size(u32::MAX)
             .build(
                 listen_address
                     .to_socket_addrs()
@@ -126,10 +123,9 @@ impl Service {
                     .next()
                     .expect("listen_address parsed"),
             )
-            .unwrap();
+            .await
+            .expect("build server");
 
-        // let mut io_handler: MetaIoHandler<RelayMetadata, _> =
-        //     MetaIoHandler::with_middleware(CkbRelayMiddleware::new(self.ckb_client.clone()));
         let mercury_rpc_impl = MercuryRpcImpl::new(
             self.store.clone(),
             self.builtin_scripts.clone(),
@@ -139,6 +135,7 @@ impl Service {
             self.cellbase_maturity.clone(),
             Arc::clone(&self.sync_state),
             self.pool_cache_size,
+            self.is_pprof_enabled,
         );
 
         info!("Mercury Running!");
@@ -148,7 +145,7 @@ impl Service {
             .expect("Start jsonrpc http server")
     }
 
-    pub async fn do_sync(&mut self, sync_task_size: usize, max_task_number: usize) -> Result<()> {
+    pub async fn do_sync(&mut self, max_task_number: usize) -> Result<()> {
         let db_tip = self
             .store
             .get_tip(Context::new())
@@ -164,7 +161,6 @@ impl Service {
         let sync_handler = Synchronization::new(
             self.store.inner(),
             Arc::new(self.ckb_client.clone()),
-            sync_task_size,
             max_task_number,
             node_tip,
             Arc::clone(&self.sync_state),
@@ -174,10 +170,17 @@ impl Service {
             && node_tip
                 .checked_sub(mercury_count.saturating_sub(1))
                 .ok_or_else(|| anyhow!("chain tip is less than db tip"))?
-                < 1000
+                < TASK_LEN
         {
-            sync_handler.build_indexer_cell_table().await?;
-            return Ok(());
+            return Synchronization::new(
+                self.store.inner(),
+                Arc::new(self.ckb_client.clone()),
+                max_task_number,
+                db_tip,
+                Arc::clone(&self.sync_state),
+            )
+            .build_indexer_cell_table()
+            .await;
         }
 
         log::info!("start sync");
@@ -227,7 +230,7 @@ impl Service {
                             self.store
                                 .append_block(Context::new(), block)
                                 .await
-                                .unwrap();
+                                .expect("append block");
                             let duration = start.elapsed();
                             log::info!(
                                 "append {} time elapsed is: {:?} ms",
@@ -239,7 +242,7 @@ impl Service {
                             self.store
                                 .rollback_block(Context::new(), tip_number, tip_hash)
                                 .await
-                                .unwrap();
+                                .expect("rollback block");
                         }
                     }
 
@@ -261,7 +264,7 @@ impl Service {
                         self.store
                             .append_block(Context::new(), block)
                             .await
-                            .unwrap();
+                            .expect("append block");
                     }
 
                     Ok(None) => {
@@ -288,7 +291,7 @@ impl Service {
             .await?
             .get(0)
             .cloned()
-            .unwrap();
+            .ok_or_else(|| anyhow!("get block view"))?;
         let duration = start.elapsed();
         log::info!(
             "get block number {}, time elapsed is: {:?} ms",

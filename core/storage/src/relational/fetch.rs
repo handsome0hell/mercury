@@ -23,13 +23,18 @@ use ckb_types::{packed, prelude::*, H256};
 
 use std::collections::HashMap;
 use std::convert::From;
+use std::slice::Iter;
 
 macro_rules! build_next_cursor {
     ($page: expr, $pagination: expr) => {{
-        if $page.records.is_empty() || $page.total == $pagination.limit.unwrap_or(u64::MAX) {
+        if $page.records.is_empty()
+            || $page.search_count
+                && $page.total <= $pagination.limit.map(Into::into).unwrap_or(u64::MAX)
+            || ($page.records.len() as u64) < $pagination.limit.map(Into::into).unwrap_or(u64::MAX)
+        {
             None
         } else {
-            Some($page.records.last().cloned().unwrap().id)
+            Some($page.records.last().cloned().unwrap().id as u64)
         }
     }};
 }
@@ -47,7 +52,7 @@ impl RelationalStorage {
         Ok(res.map(|t| {
             (
                 t.block_number,
-                H256::from_slice(&t.block_hash.inner[0..32]).unwrap(),
+                H256::from_slice(&t.block_hash.inner[0..32]).expect("get block hash h256"),
             )
         }))
     }
@@ -100,8 +105,7 @@ impl RelationalStorage {
 
     async fn get_block_view(&self, ctx: Context, block: &BlockTable) -> Result<BlockView> {
         let header = build_header_view(block);
-        let uncles = packed::UncleBlockVec::from_slice(&block.uncles.inner)
-            .unwrap()
+        let uncles = packed::UncleBlockVec::from_slice(&block.uncles.inner)?
             .into_iter()
             .map(|uncle| uncle.into_view())
             .collect::<Vec<_>>();
@@ -139,7 +143,7 @@ impl RelationalStorage {
             res.epoch_length.into(),
         )
         .to_rational();
-        let block_hash = H256::from_slice(&res.block_hash.inner[0..32]).unwrap();
+        let block_hash = H256::from_slice(&res.block_hash.inner[0..32]).expect("get block hash");
         let block_number = res.block_number;
         let tx_index = res.tx_index as u32;
 
@@ -173,20 +177,11 @@ impl RelationalStorage {
             }
 
             Ok(Some(
-                H256::from_slice(&table.consumed_tx_hash.inner[0..32]).unwrap(),
+                H256::from_slice(&table.consumed_tx_hash.inner[0..32]).expect("get tx hash"),
             ))
         } else {
             Ok(None)
         }
-    }
-
-    async fn query_consume_cells_by_tx_hashes(
-        &self,
-        tx_hashes: &[RbBytes],
-    ) -> Result<Vec<CellTable>> {
-        let w = self.pool.wrapper().in_array("consumed_tx_hash", tx_hashes);
-        let ret = self.pool.fetch_list_by_wrapper::<CellTable>(w).await?;
-        Ok(ret)
     }
 
     pub(crate) async fn get_transaction_views(
@@ -213,7 +208,7 @@ impl RelationalStorage {
 
         let tx_hashes: Vec<RbBytes> = txs.iter().map(|tx| tx.tx_hash.clone()).collect();
         let output_cells = self.query_txs_output_cells(&tx_hashes).await?;
-        let input_cells = self.query_consume_cells_by_tx_hashes(&tx_hashes).await?;
+        let input_cells = self.query_txs_input_cells(&tx_hashes).await?;
 
         let mut txs_output_cells: HashMap<Vec<u8>, Vec<CellTable>> = tx_hashes
             .iter()
@@ -242,14 +237,22 @@ impl RelationalStorage {
                 let witnesses = build_witnesses(tx.witnesses.inner.clone());
                 let header_deps = build_header_deps(tx.header_deps.inner.clone());
                 let cell_deps = build_cell_deps(tx.cell_deps.inner.clone());
-                let input_tables = txs_input_cells.get(&tx.tx_hash.inner).cloned().unwrap();
-                let mut inputs = build_cell_inputs(input_tables.clone());
+
+                let input_tables = txs_input_cells
+                    .get(&tx.tx_hash.inner)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut inputs = build_cell_inputs(input_tables.iter());
                 if inputs.is_empty() && tx.tx_index == 0 {
                     inputs = vec![build_cell_base_input(tx.block_number)]
                 };
 
-                let output_tables = txs_output_cells.get(&tx.tx_hash.inner).cloned();
-                let (outputs, outputs_data) = build_cell_outputs(output_tables.clone());
+                let output_tables = txs_output_cells
+                    .get(&tx.tx_hash.inner)
+                    .cloned()
+                    .unwrap_or_default();
+                let (outputs, outputs_data) = build_cell_outputs(&output_tables);
+
                 let transaction_view = build_transaction_view(
                     tx.version as u32,
                     witnesses,
@@ -261,19 +264,12 @@ impl RelationalStorage {
                 );
                 let transaction_with_status = TransactionWithStatus::with_committed(
                     Some(transaction_view.clone()),
-                    H256::from_slice(tx.block_hash.inner.as_slice()).unwrap(),
+                    H256::from_slice(tx.block_hash.inner.as_slice()).expect("get block hash"),
                 );
 
                 let is_cellbase = tx.tx_index == 0;
-
-                let input_cells: Vec<DetailedCell> =
-                    input_tables.into_iter().map(Into::into).collect();
-
-                let output_cells: Vec<DetailedCell> = match output_tables {
-                    Some(output_tables) => output_tables.into_iter().map(Into::into).collect(),
-                    None => vec![],
-                };
-
+                let input_cells = input_tables.into_iter().map(Into::into).collect();
+                let output_cells = output_tables.into_iter().map(Into::into).collect();
                 let timestamp = tx.tx_timestamp;
 
                 TransactionWrapper {
@@ -403,8 +399,7 @@ impl RelationalStorage {
         let res = res.ok_or_else(|| {
             DBError::NotExist(format!(
                 "live cell with out point {} {}",
-                tx_hash.to_string(),
-                output_index
+                tx_hash, output_index
             ))
         })?;
         let cell: CellTable = res.into();
@@ -433,6 +428,8 @@ impl RelationalStorage {
         lock_hashes: Vec<RbBytes>,
         type_hashes: Vec<RbBytes>,
         block_range: Option<Range>,
+        capacity_range: Option<Range>,
+        data_len_range: Option<Range>,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<DetailedCell>> {
         if lock_hashes.is_empty()
@@ -453,31 +450,48 @@ impl RelationalStorage {
             let lock_hash: H256 = cell.cell_output.lock().calc_script_hash().unpack();
             let lock_hash = to_rb_bytes(&lock_hash.0);
             if !lock_hashes.is_empty() {
-                is_ok = lock_hashes.contains(&lock_hash) && is_ok
+                is_ok &= lock_hashes.contains(&lock_hash)
             };
 
             if let Some(type_script) = cell.cell_output.type_().to_opt() {
                 let type_hash: H256 = type_script.calc_script_hash().unpack();
                 let type_hash = to_rb_bytes(&type_hash.0);
                 if !type_hashes.is_empty() {
-                    is_ok = type_hashes.contains(&type_hash) && is_ok
+                    is_ok &= type_hashes.contains(&type_hash)
                 };
             } else if !type_hashes.is_empty() {
-                is_ok = false
+                let default_hashes = vec![H256::default()]
+                    .into_iter()
+                    .map(|hash| to_rb_bytes(&hash.0))
+                    .collect::<Vec<_>>();
+                is_ok &= type_hashes == default_hashes
             }
 
             if let Some(range) = block_range {
-                is_ok = range.is_in(cell.block_number);
+                is_ok &= range.is_in(cell.block_number);
+            }
+
+            if let Some(range) = capacity_range {
+                is_ok &= range.is_in(cell.cell_output.capacity().unpack())
+            }
+
+            if let Some(range) = data_len_range {
+                is_ok &= range.is_in(cell.cell_data.len() as u64)
             }
 
             let mut response: Vec<DetailedCell> = vec![];
             if is_ok {
                 response.push(cell);
             }
+            let count = response.len() as u64;
             return Ok(PaginationResponse {
                 response,
                 next_cursor: None,
-                count: None,
+                count: if pagination.return_count {
+                    Some(count)
+                } else {
+                    None
+                },
             });
         }
 
@@ -497,19 +511,38 @@ impl RelationalStorage {
                 .between("block_number", range.min(), range.max())
         }
 
+        if let Some(range) = capacity_range {
+            wrapper = wrapper.and().between("capacity", range.min(), range.max())
+        }
+
+        if let Some(range) = data_len_range {
+            wrapper = wrapper
+                .and()
+                .between("LENGTH(data)", range.min(), range.max())
+        }
+
         let mut conn = self.pool.acquire().await?;
         let cells: Page<LiveCellTable> = conn
             .fetch_page_by_wrapper(wrapper, &PageRequest::from(pagination.clone()))
             .await?;
-        let mut res = Vec::new();
         let next_cursor = build_next_cursor!(cells, pagination);
-
-        for r in cells.records.iter() {
-            let cell: CellTable = r.to_owned().into();
-            res.push(cell.into());
-        }
-
-        Ok(to_pagination_response(res, next_cursor, Some(cells.total)))
+        let res = cells
+            .records
+            .into_iter()
+            .map(|r| {
+                let cell: CellTable = r.into();
+                cell.into()
+            })
+            .collect();
+        Ok(to_pagination_response(
+            res,
+            next_cursor,
+            if pagination.return_count {
+                Some(cells.total)
+            } else {
+                None
+            },
+        ))
     }
 
     pub(crate) async fn query_cells(
@@ -519,6 +552,7 @@ impl RelationalStorage {
         lock_hashes: Vec<RbBytes>,
         type_hashes: Vec<RbBytes>,
         block_range: Option<Range>,
+        limit_cellbase: bool,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<DetailedCell>> {
         if lock_hashes.is_empty()
@@ -538,31 +572,44 @@ impl RelationalStorage {
             let lock_hash: H256 = cell.cell_output.lock().calc_script_hash().unpack();
             let lock_hash = to_rb_bytes(&lock_hash.0);
             if !lock_hashes.is_empty() {
-                is_ok = lock_hashes.contains(&lock_hash) && is_ok
+                is_ok &= lock_hashes.contains(&lock_hash)
             };
 
             if let Some(type_script) = cell.cell_output.type_().to_opt() {
                 let type_hash: H256 = type_script.calc_script_hash().unpack();
                 let type_hash = to_rb_bytes(&type_hash.0);
                 if !type_hashes.is_empty() {
-                    is_ok = type_hashes.contains(&type_hash) && is_ok
+                    is_ok &= type_hashes.contains(&type_hash)
                 };
             } else if !type_hashes.is_empty() {
-                is_ok = false
+                let default_hashes = vec![H256::default()]
+                    .into_iter()
+                    .map(|hash| to_rb_bytes(&hash.0))
+                    .collect::<Vec<_>>();
+                is_ok &= type_hashes == default_hashes
             }
 
             if let Some(range) = block_range {
-                is_ok = range.is_in(cell.block_number);
+                is_ok &= range.is_in(cell.block_number);
+            }
+
+            if limit_cellbase {
+                is_ok &= cell.tx_index == 0;
             }
 
             let mut response: Vec<DetailedCell> = vec![];
             if is_ok {
                 response.push(cell);
             }
+            let count = response.len() as u64;
             return Ok(PaginationResponse {
                 response,
                 next_cursor: None,
-                count: None,
+                count: if pagination.return_count {
+                    Some(count)
+                } else {
+                    None
+                },
             });
         }
 
@@ -586,18 +633,25 @@ impl RelationalStorage {
                 .push_sql(")");
         }
 
+        if limit_cellbase {
+            wrapper = wrapper.and().eq("tx_index", 0)
+        }
+
         let mut conn = self.pool.acquire().await?;
         let cells: Page<CellTable> = conn
             .fetch_page_by_wrapper(wrapper, &PageRequest::from(pagination.clone()))
             .await?;
-        let mut res = Vec::new();
         let next_cursor = build_next_cursor!(cells, pagination);
-
-        for r in cells.records.iter() {
-            res.push(r.to_owned().into());
-        }
-
-        Ok(to_pagination_response(res, next_cursor, Some(cells.total)))
+        let res = cells.records.into_iter().map(Into::into).collect();
+        Ok(to_pagination_response(
+            res,
+            next_cursor,
+            if pagination.return_count {
+                Some(cells.total)
+            } else {
+                None
+            },
+        ))
     }
 
     pub(crate) async fn query_historical_live_cells(
@@ -607,7 +661,8 @@ impl RelationalStorage {
         type_hashes: Vec<RbBytes>,
         tip_block_number: u64,
         out_point: Option<packed::OutPoint>,
-    ) -> Result<Vec<DetailedCell>> {
+        pagination: PaginationRequest,
+    ) -> Result<PaginationResponse<DetailedCell>> {
         let mut w = self
             .pool
             .wrapper()
@@ -635,13 +690,20 @@ impl RelationalStorage {
 
         let mut conn = self.pool.acquire().await?;
 
-        let res = conn
-            .fetch_list_by_wrapper::<CellTable>(w)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>();
-        Ok(res)
+        let cells: Page<CellTable> = conn
+            .fetch_page_by_wrapper(w, &PageRequest::from(pagination.clone()))
+            .await?;
+        let next_cursor = build_next_cursor!(cells, pagination);
+        let res = cells.records.into_iter().map(Into::into).collect();
+        Ok(to_pagination_response(
+            res,
+            next_cursor,
+            if pagination.return_count {
+                Some(cells.total)
+            } else {
+                None
+            },
+        ))
     }
 
     // TODO: query refactoring
@@ -705,16 +767,19 @@ impl RelationalStorage {
         }
 
         let mut conn = self.pool.acquire().await?;
-        let mut res: Page<IndexerCellTable> = conn
+        let res: Page<IndexerCellTable> = conn
             .fetch_page_by_wrapper(w, &PageRequest::from(pagination.clone()))
             .await?;
-        res.records.sort();
         let next_cursor = build_next_cursor!(res, pagination);
 
         Ok(to_pagination_response(
             res.records,
             next_cursor,
-            Some(res.total),
+            if pagination.return_count {
+                Some(res.total)
+            } else {
+                None
+            },
         ))
     }
 
@@ -760,7 +825,7 @@ impl RelationalStorage {
         }
 
         if let Some(range) = block_range {
-            wrapper = wrapper.between("block_number", range.from, range.to);
+            wrapper = wrapper.between("block_number", range.min(), range.max());
         }
 
         let mut conn = self.pool.acquire().await?;
@@ -772,7 +837,11 @@ impl RelationalStorage {
         Ok(to_pagination_response(
             txs.records,
             next_cursor,
-            Some(txs.total),
+            if pagination.return_count {
+                Some(txs.total)
+            } else {
+                None
+            },
         ))
     }
 
@@ -781,18 +850,25 @@ impl RelationalStorage {
             return Ok(Vec::new());
         }
 
-        let w = self.pool.wrapper().r#in("tx_hash", tx_hashes);
+        let w = self
+            .pool
+            .wrapper()
+            .r#in("tx_hash", tx_hashes)
+            .order_by(true, &["output_index"]);
         let cells: Vec<CellTable> = self.pool.fetch_list_by_wrapper(w).await?;
-
         Ok(cells)
     }
 
-    async fn _query_txs_input_cells(&self, tx_hashes: &[RbBytes]) -> Result<Vec<CellTable>> {
+    async fn query_txs_input_cells(&self, tx_hashes: &[RbBytes]) -> Result<Vec<CellTable>> {
+        if tx_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let w = self
             .pool
             .wrapper()
             .r#in("consumed_tx_hash", tx_hashes)
-            .order_by(true, &["consumed_tx_hash", "input_index"]);
+            .order_by(true, &["input_index"]);
         let cells: Vec<CellTable> = self.pool.fetch_list_by_wrapper(w).await?;
         Ok(cells)
     }
@@ -882,11 +958,8 @@ fn build_cell_base_input(block_number: u64) -> packed::CellInput {
         .build()
 }
 
-fn build_cell_inputs(mut input_cells: Vec<CellTable>) -> Vec<packed::CellInput> {
-    input_cells.sort_by_key(|c| c.input_index);
-
+fn build_cell_inputs(input_cells: Iter<CellTable>) -> Vec<packed::CellInput> {
     input_cells
-        .iter()
         .map(|cell| {
             let out_point = packed::OutPointBuilder::default()
                 .tx_hash(
@@ -904,39 +977,26 @@ fn build_cell_inputs(mut input_cells: Vec<CellTable>) -> Vec<packed::CellInput> 
         .collect()
 }
 
-fn build_cell_outputs(
-    cell_lock_types: Option<Vec<CellTable>>,
-) -> (Vec<packed::CellOutput>, Vec<packed::Bytes>) {
-    let mut cells = match cell_lock_types {
-        Some(cells) => cells,
-        None => return (vec![], vec![]),
-    };
-
-    cells.sort_by_key(|c| c.output_index);
-
-    let mut ret_cells = Vec::new();
-    let mut ret_datas = Vec::new();
-
-    for cell in cells.iter() {
-        let lock_script: packed::Script = cell.to_lock_script_table().into();
-        let type_script_opt = build_script_opt(if cell.has_type_script() {
-            Some(cell.to_type_script_table())
-        } else {
-            None
-        });
-        let cell_data: packed::Bytes = cell.data.inner.pack();
-
-        ret_cells.push(
-            packed::CellOutputBuilder::default()
-                .capacity(cell.capacity.pack())
-                .lock(lock_script)
-                .type_(type_script_opt)
-                .build(),
-        );
-        ret_datas.push(cell_data);
-    }
-
-    (ret_cells, ret_datas)
+fn build_cell_outputs(cells: &[CellTable]) -> (Vec<packed::CellOutput>, Vec<packed::Bytes>) {
+    (
+        cells
+            .iter()
+            .map(|cell| {
+                let lock_script: packed::Script = cell.to_lock_script_table().into();
+                let type_script_opt = build_script_opt(if cell.has_type_script() {
+                    Some(cell.to_type_script_table())
+                } else {
+                    None
+                });
+                packed::CellOutputBuilder::default()
+                    .capacity(cell.capacity.pack())
+                    .lock(lock_script)
+                    .type_(type_script_opt)
+                    .build()
+            })
+            .collect(),
+        cells.iter().map(|cell| cell.data.inner.pack()).collect(),
+    )
 }
 
 fn build_script_opt(script_opt: Option<ScriptTable>) -> packed::ScriptOpt {
@@ -966,16 +1026,16 @@ fn build_transaction_view(
 
 pub fn to_pagination_response<T>(
     records: Vec<T>,
-    next: Option<i64>,
+    next: Option<u64>,
     total: Option<u64>,
 ) -> PaginationResponse<T> {
     PaginationResponse {
         response: records,
-        next_cursor: next.map(|v| Bytes::from(v.to_be_bytes().to_vec())),
-        count: total,
+        next_cursor: next.map(Into::into),
+        count: total.map(Into::into),
     }
 }
 
 pub fn rb_bytes_to_h256(input: &RbBytes) -> H256 {
-    H256::from_slice(&input.inner[0..32]).unwrap()
+    H256::from_slice(&input.inner[0..32]).expect("rb bytes to h256")
 }

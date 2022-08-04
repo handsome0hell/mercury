@@ -47,8 +47,8 @@ pub enum CoreError {
     #[display(fmt = "Get epoch error of block number {}", _0)]
     GetEpochFromNumberError(u64),
 
-    #[display(fmt = "Adjust account on ckb")]
-    AdjustAccountOnCkb,
+    #[display(fmt = "Adjust account without UDT info")]
+    AdjustAccountWithoutUDTInfo,
 
     #[display(fmt = "Need at least one item in from")]
     NeedAtLeastOneFrom,
@@ -76,6 +76,9 @@ pub enum CoreError {
 
     #[display(fmt = "Required CKB is less than mininum")]
     RequiredCKBLessThanMin,
+
+    #[display(fmt = "Required CKB is more than max")]
+    RequiredCKBMoreThanMax,
 
     #[display(fmt = "Cannot find address by H160")]
     CannotFindAddressByH160,
@@ -116,9 +119,6 @@ pub enum CoreError {
     #[display(fmt = "Unsupport identity flag")]
     UnsupportIdentityFlag,
 
-    #[display(fmt = "Unsupport ownership")]
-    UnsupportOwnership,
-
     #[display(fmt = "Unsupport address")]
     UnsupportAddress,
 
@@ -142,6 +142,15 @@ pub enum CoreError {
 
     #[display(fmt = "Cannot find cell")]
     CannotFindCell(String),
+
+    #[display(fmt = "Unsupport transfer mode: {}", _0)]
+    UnsupportTransferMode(String),
+
+    #[display(fmt = "Amount should be positive")]
+    AmountMustPositive,
+
+    #[display(fmt = "When issuing udt from items must contain owner item")]
+    FromNotContainOwner,
 }
 
 impl RpcError for CoreError {
@@ -168,18 +177,20 @@ impl RpcError for CoreError {
             CoreError::ParseAddressError(_) => -11022,
             CoreError::ItemsNotSameEnumValue => -11023,
             CoreError::UnsupportIdentityFlag => -11024,
-            CoreError::UnsupportOwnership => -11025,
+            CoreError::AmountMustPositive => -11025,
+
             CoreError::UnsupportAddress => -11026,
             CoreError::InvalidTxPrebuilt(_) => -11027,
             CoreError::CkbClientError(_) => -11028,
             CoreError::CkbIsNotEnough(_) => -11029,
             CoreError::UDTIsNotEnough(_) => -11030,
+            CoreError::UnsupportTransferMode(_) => -11031,
 
             CoreError::MissingConsumedInfo => -10020,
 
             CoreError::CannotFindSpentTransaction => -10090,
 
-            CoreError::AdjustAccountOnCkb => -10040,
+            CoreError::AdjustAccountWithoutUDTInfo => -10040,
             CoreError::InvalidAdjustAccountNumber => -10041,
             CoreError::NotZeroInputUDTAmount => -10042,
 
@@ -189,6 +200,7 @@ impl RpcError for CoreError {
             CoreError::TransferAmountMustPositive => -10053,
             CoreError::InvalidFeeChange => -10054,
             CoreError::FromContainTo => -10055,
+            CoreError::RequiredCKBMoreThanMax => -10056,
 
             CoreError::NeedAtLeastOneFrom => -10070,
             CoreError::InvalidDAOCapacity => -10071,
@@ -198,6 +210,7 @@ impl RpcError for CoreError {
             CoreError::InvalidOutPoint => -10111,
 
             CoreError::NeedAtLeastOneTo => -10120,
+            CoreError::FromNotContainOwner => -10121,
 
             CoreError::MissingAxonCellInfo(_) => -10130,
             CoreError::CannotFindCell(_) => -10131,

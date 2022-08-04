@@ -13,10 +13,12 @@ cheque_since = 6
 
 pool_cache_size = 100
 
+is_pprof_enabled = true
+
 [db_config]
 center_id = 0
 machine_id = 0
-max_connections = 1000
+max_connections = 100
 min_connections = 0
 connect_timeout = 60
 max_lifetime = 1800
@@ -45,7 +47,7 @@ listen_uri = "127.0.0.1:8116"
 
 [sync_config]
 sync_block_batch_size = 1000
-max_task_number = 30
+max_task_number = 4     # same as the number of cpu cores in the Recommended Hardware section of the README
 
 [[builtin_scripts]]
 script_name = "secp256k1_blake160"
@@ -145,7 +147,6 @@ cell_dep = '''
 }
 '''
 
-
 [[builtin_scripts]]
 script_name = "axon_selection"
 script = '''
@@ -241,6 +242,25 @@ cell_dep = '''
     "out_point": {
         "index": "0x0",
         "tx_hash": "0x9154df4f7336402114d04495175b37390ce86a4906d2d4001cf02c3e6d97f39c",
+    }
+}
+'''
+
+[[builtin_scripts]]
+script_name = "pw_lock"
+script = '''
+{
+    "args": "0x",
+    "code_hash": "0x58c5f491aba6d61678b7cf7edf4910b1f5e00ec0cde2f42e0abb4fd9aff25a63",
+    "hash_type": "type"
+}
+'''
+cell_dep = '''
+{
+    "dep_type": "code",
+    "out_point": {
+        "index": "0x0",
+        "tx_hash": "0x57a62003daeab9d54aa29b944fc3b451213a5ebdf2e232216a3cfed0dde61b38"
     }
 }
 '''

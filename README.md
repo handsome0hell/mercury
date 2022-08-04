@@ -32,19 +32,21 @@ There are three ways to use Mercury.
 ### 1. Quick Experience
 
 The Mercury official provides public servers for a quick experience of Mercury.
-The request url for mainnet is https://Mercury-mainnet.ckbapp.dev/ , for testnet is https://Mercury-testnet.ckbapp.dev/ .
 
-For example, you can use the following command to call Mercury API methods.
+For version 0.2, The request url for mainnet is https://Mercury-mainnet.ckbapp.dev/0.2 , for testnet is https://Mercury-testnet.ckbapp.dev/0.2 .
+
+For version 0.3, the request url for mainnet is https://Mercury-mainnet.ckbapp.dev/0.3 , for testnet is https://Mercury-testnet.ckbapp.dev/0.3 .
+
+For version 0.4, the request url for mainnet is https://Mercury-mainnet.ckbapp.dev/0.4 , for testnet is https://Mercury-testnet.ckbapp.dev/0.4 .
+
+For example, you can use the following command to call a Mercury API method to view the version.
 
 ```shell
-$ echo '{
+echo '{
     "id": 1234,
     "jsonrpc": "2.0",
-    "method": "get_block_info",
-    "params": [{
-        "block_number": 10000, 
-        "block_hash": null
-    }]
+    "method": "get_mercury_info",
+    "params": []
 }' \
 | tr -d '\n' \
 | curl -H 'content-type: application/json' -d @- https://Mercury-testnet.ckbapp.dev
@@ -82,7 +84,7 @@ $ Mercury -c ~/path/to/mercury/devtools/config/testnet_config.toml run
 
 #### Recommended Hardware
 
-8 Cores - 16G Memory - 500G Disk and above.
+4 Cores - 8G Memory - 500G Disk and above.
 
 If you use a standalone server to run the Postgres server, a 50G Disk is enough.
 
@@ -128,7 +130,7 @@ $ docker run -d -p 8116:8116 -v {user_config_path}:/app/devtools/config Mercury:
 
 #### Recommended Hardware
 
-8 Cores - 16G Memory - 500G Disk and above.
+4 Cores - 8G Memory - 500G Disk and above.
 
 #### Expected Synchronization Duration
 

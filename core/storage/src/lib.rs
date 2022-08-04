@@ -1,13 +1,11 @@
 #![allow(clippy::mutable_key_type)]
 
 pub mod error;
-pub mod kvdb;
 pub mod relational;
 
 pub use protocol::db::{DBDriver, DBInfo, SimpleBlock, SimpleTransaction, TransactionWrapper};
-pub use relational::RelationalStorage;
-
 use relational::table::IndexerCellTable;
+pub use relational::RelationalStorage;
 
 use common::{
     async_trait, Context, DetailedCell, PaginationRequest, PaginationResponse, Range, Result,
@@ -37,6 +35,8 @@ pub trait Storage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         block_range: Option<Range>,
+        capacity_range: Option<Range>,
+        data_len_range: Option<Range>,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<DetailedCell>>;
 
@@ -48,7 +48,8 @@ pub trait Storage {
         type_hashes: Vec<H256>,
         tip_block_number: BlockNumber,
         out_point: Option<packed::OutPoint>,
-    ) -> Result<Vec<DetailedCell>>;
+        pagination: PaginationRequest,
+    ) -> Result<PaginationResponse<DetailedCell>>;
 
     /// Get cells from the database according to the given arguments.
     async fn get_cells(
@@ -69,6 +70,7 @@ pub trait Storage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         block_range: Option<Range>,
+        limit_cellbase: bool,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<TransactionWrapper>>;
 
@@ -86,6 +88,7 @@ pub trait Storage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         block_range: Option<Range>,
+        limit_cellbase: bool,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<TransactionWrapper>>;
 
@@ -155,7 +158,7 @@ pub trait Storage {
     async fn get_scripts_by_partial_arg(
         &self,
         ctx: Context,
-        code_hash: H256,
+        code_hash: &H256,
         arg: Bytes,
         offset_location: (u32, u32),
     ) -> Result<Vec<packed::Script>>;
@@ -216,7 +219,9 @@ pub trait ExtensionStorage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         tip_block_number: BlockNumber,
-    ) -> Result<Vec<DetailedCell>>;
+        out_point: Option<packed::OutPoint>,
+        pagination: PaginationRequest,
+    ) -> Result<PaginationResponse<DetailedCell>>;
 
     async fn get_cells(
         &self,

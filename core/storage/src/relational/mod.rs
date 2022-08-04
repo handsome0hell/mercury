@@ -27,7 +27,6 @@ use ckb_types::{bytes::Bytes, packed, H160, H256};
 use log::LevelFilter;
 
 use std::collections::HashSet;
-use std::convert::TryInto;
 
 const HASH160_LEN: usize = 20;
 
@@ -96,6 +95,7 @@ impl Storage for RelationalStorage {
             lock_hashes,
             type_hashes,
             block_range,
+            false,
             pagination,
         )
         .await
@@ -108,6 +108,8 @@ impl Storage for RelationalStorage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         block_range: Option<Range>,
+        capacity_range: Option<Range>,
+        data_len_range: Option<Range>,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<DetailedCell>> {
         let lock_hashes = lock_hashes
@@ -126,6 +128,8 @@ impl Storage for RelationalStorage {
             lock_hashes,
             type_hashes,
             block_range,
+            capacity_range,
+            data_len_range,
             pagination,
         )
         .await
@@ -138,7 +142,8 @@ impl Storage for RelationalStorage {
         type_hashes: Vec<H256>,
         tip_block_number: BlockNumber,
         out_point: Option<packed::OutPoint>,
-    ) -> Result<Vec<DetailedCell>> {
+        pagination: PaginationRequest,
+    ) -> Result<PaginationResponse<DetailedCell>> {
         if lock_hashes.is_empty() {
             return Err(DBError::InvalidParameter(
                 "no valid parameter to query historical live cells".to_owned(),
@@ -156,8 +161,15 @@ impl Storage for RelationalStorage {
             .map(|hash| to_rb_bytes(&hash.0))
             .collect::<Vec<_>>();
 
-        self.query_historical_live_cells(ctx, lock_hashes, type_hashes, tip_block_number, out_point)
-            .await
+        self.query_historical_live_cells(
+            ctx,
+            lock_hashes,
+            type_hashes,
+            tip_block_number,
+            out_point,
+            pagination,
+        )
+        .await
     }
 
     async fn get_transactions(
@@ -167,6 +179,7 @@ impl Storage for RelationalStorage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         block_range: Option<Range>,
+        limit_cellbase: bool,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<TransactionWrapper>> {
         if out_point.is_none()
@@ -198,6 +211,7 @@ impl Storage for RelationalStorage {
                     lock_hashes,
                     type_hashes,
                     block_range.clone(),
+                    limit_cellbase,
                     Default::default(),
                 )
                 .await?
@@ -209,28 +223,32 @@ impl Storage for RelationalStorage {
                     set.insert(hash.0.to_vec());
                 }
             }
+            if set.is_empty() {
+                return Ok(PaginationResponse {
+                    response: vec![],
+                    next_cursor: None,
+                    count: if pagination.return_count {
+                        Some(0)
+                    } else {
+                        None
+                    },
+                });
+            }
         }
-        let tx_hashes = set.iter().map(|bytes| to_rb_bytes(bytes)).collect();
 
+        let tx_hashes = set.iter().map(|bytes| to_rb_bytes(bytes)).collect();
         let tx_tables = self
             .query_transactions(ctx.clone(), tx_hashes, block_range, pagination)
             .await?;
         let txs_wrapper = self
             .get_transactions_with_status(ctx, tx_tables.response)
             .await?;
-        let next_cursor = tx_tables.next_cursor.map(|bytes| {
-            i64::from_be_bytes(
-                bytes
-                    .to_vec()
-                    .try_into()
-                    .expect("slice with incorrect length"),
-            )
-        });
+        let next_cursor: Option<u64> = tx_tables.next_cursor.map(Into::into);
 
         Ok(to_pagination_response(
             txs_wrapper,
             next_cursor,
-            Some(tx_tables.count.unwrap_or(0)),
+            tx_tables.count.map(Into::into),
         ))
     }
 
@@ -258,19 +276,12 @@ impl Storage for RelationalStorage {
         let txs_wrapper = self
             .get_transactions_with_status(ctx.clone(), tx_tables.response)
             .await?;
-        let next_cursor = tx_tables.next_cursor.map(|bytes| {
-            i64::from_be_bytes(
-                bytes
-                    .to_vec()
-                    .try_into()
-                    .expect("slice with incorrect length"),
-            )
-        });
+        let next_cursor: Option<u64> = tx_tables.next_cursor.map(Into::into);
 
         Ok(to_pagination_response(
             txs_wrapper,
             next_cursor,
-            Some(tx_tables.count.unwrap_or(0)),
+            tx_tables.count.map(Into::into),
         ))
     }
 
@@ -280,6 +291,7 @@ impl Storage for RelationalStorage {
         lock_hashes: Vec<H256>,
         type_hashes: Vec<H256>,
         block_range: Option<Range>,
+        limit_cellbase: bool,
         pagination: PaginationRequest,
     ) -> Result<PaginationResponse<TransactionWrapper>> {
         if block_range.is_none() && lock_hashes.is_empty() && type_hashes.is_empty() {
@@ -291,13 +303,17 @@ impl Storage for RelationalStorage {
         let is_asc = pagination.order.is_asc();
         let mut conn = self.pool.acquire().await?;
 
-        let cursor = if let Some(cur) = pagination.cursor.clone() {
-            i64::from_be_bytes(to_fixed_array(&cur[0..8]))
-        } else if is_asc {
-            i64::MIN
-        } else {
-            i64::MAX
-        };
+        // The id type in the table definition is i64,
+        // so it is necessary to limit the numerical range of cursor and limit of type u64,
+        // therwise a database error will be returned when querying
+        let cursor = pagination
+            .cursor
+            .map(|cur| cur.min(i64::MAX as u64) as i64)
+            .unwrap_or(if is_asc { 0 } else { i64::MAX });
+        let limit = pagination
+            .limit
+            .map(|limit| limit.min(i64::MAX as u64) as i64)
+            .unwrap_or(i64::MAX);
 
         let lock_hashes = lock_hashes
             .into_iter()
@@ -307,15 +323,13 @@ impl Storage for RelationalStorage {
             .into_iter()
             .map(|hash| to_rb_bytes(&hash.0))
             .collect::<Vec<_>>();
-
-        let limit = pagination.limit.unwrap_or(u64::MAX);
         let (from, to) = if let Some(range) = block_range.clone() {
             (range.min(), range.max())
         } else {
             (0, 1)
         };
 
-        let mut tx_hashes = sql::fetch_distinct_tx_hashes(
+        let tx_hashes = sql::fetch_distinct_tx_hashes(
             &mut conn,
             &cursor,
             &from,
@@ -325,19 +339,19 @@ impl Storage for RelationalStorage {
             &limit,
             &is_asc,
             &block_range.is_some(),
+            &limit_cellbase,
         )
         .await?;
 
         let count = if pagination.return_count {
             let count = sql::fetch_distinct_tx_hashes_count(
                 &mut conn,
-                &cursor,
                 &from,
                 &to,
                 &lock_hashes,
                 &type_hashes,
-                &is_asc,
                 &block_range.is_some(),
+                &limit_cellbase,
             )
             .await?;
             Some(count)
@@ -349,21 +363,18 @@ impl Storage for RelationalStorage {
             return Ok(PaginationResponse {
                 response: vec![],
                 next_cursor: None,
-                count: None,
+                count: count.map(Into::into),
             });
         }
 
-        tx_hashes.sort();
-        let mut next_cursor = if is_asc {
-            tx_hashes.last().map(|tx_hash| tx_hash.id)
+        let next_cursor = if tx_hashes.is_empty()
+            || count.is_some() && count.unwrap() <= limit as u64
+            || limit > tx_hashes.len() as i64
+        {
+            None
         } else {
-            tx_hashes.first().map(|tx_hash| tx_hash.id)
+            tx_hashes.last().map(|tx_hash| tx_hash.id as u64)
         };
-        if let Some(count) = count {
-            if count <= limit {
-                next_cursor = None;
-            }
-        }
 
         let pag = if is_asc {
             PaginationRequest::default()
@@ -378,6 +389,7 @@ impl Storage for RelationalStorage {
                 pag,
             )
             .await?;
+
         let txs_wrapper = self
             .get_transactions_with_status(ctx, tx_tables.response)
             .await?;
@@ -489,7 +501,7 @@ impl Storage for RelationalStorage {
     async fn get_scripts_by_partial_arg(
         &self,
         _ctx: Context,
-        code_hash: H256,
+        code_hash: &H256,
         arg: Bytes,
         offset_location: (u32, u32),
     ) -> Result<Vec<packed::Script>> {
@@ -659,7 +671,7 @@ impl RelationalStorage {
     pub async fn get_tip_number(&self) -> Result<BlockNumber> {
         let mut conn = self.pool.acquire().await?;
         let res = sql::get_tip_number(&mut conn).await?;
-        Ok(res.unwrap_or_default())
+        res.ok_or_else(|| DBError::NotExist("genesis block".to_string()).into())
     }
 }
 

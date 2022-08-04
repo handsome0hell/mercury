@@ -3,9 +3,7 @@ use crate::{address::Address, MercuryError};
 use anyhow::Result;
 use ckb_types::{packed, U256};
 use derive_more::Display;
-use num_bigint::BigUint;
 
-use std::convert::TryInto;
 use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,27 +57,16 @@ pub fn remove_item<T: Eq>(list: &mut Vec<T>, key: &T) {
     list.remove(index);
 }
 
-#[allow(dead_code)]
-pub fn u64_sub(a: u64, b: BigUint) -> u64 {
-    let b: u64 = b.try_into().unwrap();
-    a.saturating_sub(b)
-}
-
-pub fn u128_sub(a: u128, b: BigUint) -> u128 {
-    let b: u128 = b.try_into().unwrap();
-    a.saturating_sub(b)
-}
-
 pub fn unwrap_only_one<T: Clone>(vec: &[T]) -> T {
     assert!(vec.len() == 1);
     vec[0].clone()
 }
 
-pub fn decode_udt_amount(data: &[u8]) -> u128 {
+pub fn decode_udt_amount(data: &[u8]) -> Option<u128> {
     if data.len() < 16 {
-        return 0u128;
+        return None;
     }
-    u128::from_le_bytes(to_fixed_array(&data[0..16]))
+    Some(u128::from_le_bytes(to_fixed_array(&data[0..16])))
 }
 
 pub fn encode_udt_amount(amount: u128) -> Vec<u8> {
