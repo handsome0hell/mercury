@@ -42,6 +42,7 @@ log_path = "./free-space/mainnet/log"
 [network_config]
 network_type = "ckb"
 ckb_uri = "http://127.0.0.1:8114"
+ckb_indexer_uri = "http://127.0.0.1:8115"
 listen_uri = "127.0.0.1:8116"
 
 

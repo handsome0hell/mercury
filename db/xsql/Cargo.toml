@@ -8,6 +8,8 @@ edition = "2021"
 
 [dependencies]
 base64 = "0.13"
+ckb-jsonrpc-types = "0.104"
+ckb-types = "0.104"
 log = "0.4"
 rbatis = { version = "3.0", default-features = false,  features = ["all-database", "runtime-tokio-native-tls", "upper_case_sql_keyword"] }
 rbson = "2.0"

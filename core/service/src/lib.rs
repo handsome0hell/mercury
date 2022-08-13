@@ -24,6 +24,8 @@ use std::time::Instant;
 pub struct Service {
     store: RelationalStorage,
     ckb_client: CkbRpcClient,
+    ckb_uri: String,
+    ckb_indexer_uri: String,
     poll_interval: Duration,
     rpc_thread_num: usize,
     network_type: NetworkType,
@@ -53,12 +55,13 @@ impl Service {
         builtin_scripts: HashMap<String, ScriptInfo>,
         cellbase_maturity: u64,
         ckb_uri: String,
+        ckb_indexer_uri: String,
         cheque_since: u64,
         log_level: LevelFilter,
         pool_cache_size: u64,
         is_pprof_enabled: bool,
     ) -> Self {
-        let ckb_client = CkbRpcClient::new(ckb_uri);
+        let ckb_client = CkbRpcClient::new(ckb_uri.clone());
         let store = RelationalStorage::new(
             center_id,
             machine_id,
@@ -79,6 +82,8 @@ impl Service {
         Service {
             store,
             ckb_client,
+            ckb_uri,
+            ckb_indexer_uri,
             poll_interval,
             rpc_thread_num,
             network_type,
@@ -130,6 +135,8 @@ impl Service {
             self.store.clone(),
             self.builtin_scripts.clone(),
             self.ckb_client.clone(),
+            self.ckb_uri.clone(),
+            self.ckb_indexer_uri.clone(),
             self.network_type,
             self.cheque_since.clone(),
             self.cellbase_maturity.clone(),

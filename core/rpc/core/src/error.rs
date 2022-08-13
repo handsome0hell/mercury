@@ -1,6 +1,11 @@
 use common::derive_more::Display;
 use core_rpc_types::error::{MercuryRpcError, RpcError};
 
+use ckb_sdk::{
+    traits::TransactionDependencyError,
+    tx_builder::BalanceTxCapacityError,
+};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Display, Hash, PartialEq, Eq)]
@@ -110,6 +115,9 @@ pub enum CoreError {
     #[display(fmt = "Overflow")]
     Overflow,
 
+    #[display(fmt = "Failed to convert integer: {}", _0)]
+    TryFromIntError(String),
+
     #[display(fmt = "The input items must be the same kind of enumeration")]
     ItemsNotSameEnumValue,
 
@@ -151,6 +159,9 @@ pub enum CoreError {
 
     #[display(fmt = "When issuing udt from items must contain owner item")]
     FromNotContainOwner,
+
+    #[display(fmt = "Failed to balance transaction capacity: {}", _0)]
+    BalanceTxCapacityError(String),
 }
 
 impl RpcError for CoreError {
@@ -178,6 +189,7 @@ impl RpcError for CoreError {
             CoreError::ItemsNotSameEnumValue => -11023,
             CoreError::UnsupportIdentityFlag => -11024,
             CoreError::AmountMustPositive => -11025,
+            CoreError::TryFromIntError(_) => -11026,
 
             CoreError::UnsupportAddress => -11026,
             CoreError::InvalidTxPrebuilt(_) => -11027,
@@ -214,11 +226,31 @@ impl RpcError for CoreError {
 
             CoreError::MissingAxonCellInfo(_) => -10130,
             CoreError::CannotFindCell(_) => -10131,
+
+            CoreError::BalanceTxCapacityError(_) => -10132,
         }
     }
 
     fn message(&self) -> String {
         self.to_string()
+    }
+}
+
+impl From<BalanceTxCapacityError> for CoreError {
+    fn from(err: BalanceTxCapacityError) -> Self {
+        CoreError::BalanceTxCapacityError(err.to_string())
+    }
+}
+
+impl From<TransactionDependencyError> for CoreError {
+    fn from(err: TransactionDependencyError) -> Self {
+        CoreError::BalanceTxCapacityError(BalanceTxCapacityError::from(err).to_string())
+    }
+}
+
+impl From<std::num::TryFromIntError> for CoreError {
+    fn from(err: std::num::TryFromIntError) -> Self {
+        CoreError::TryFromIntError(err.to_string())
     }
 }
 

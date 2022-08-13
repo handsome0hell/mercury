@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ckb-jsonrpc-types = "0.101"
-ckb-types = "0.101"
-ckb-dao-utils = "0.101"
+ckb-jsonrpc-types = "0.104"
+ckb-types = "0.104"
+ckb-dao-utils = "0.104"
 
 common = { path = "../../../common" }
 common-logger = { path = "../../../logger" }

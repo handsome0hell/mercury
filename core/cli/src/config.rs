@@ -19,6 +19,9 @@ pub struct NetworkConfig {
     #[serde(default = "default_ckb_uri")]
     pub ckb_uri: String,
 
+    #[serde(default = "default_ckb_indexer_uri")]
+    pub ckb_indexer_uri: String,
+
     #[serde(default = "default_listen_uri")]
     pub listen_uri: String,
 }
@@ -173,6 +176,10 @@ fn default_log_level() -> String {
 
 fn default_ckb_uri() -> String {
     String::from("http://127.0.0.1:8114")
+}
+
+fn default_ckb_indexer_uri() -> String {
+    String::from("http://127.0.0.1:8115")
 }
 
 fn default_listen_uri() -> String {

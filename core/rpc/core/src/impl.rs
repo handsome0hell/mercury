@@ -17,6 +17,13 @@ use crate::{error::CoreError, MercuryRpcServer};
 use ckb_jsonrpc_types::Uint64;
 use ckb_types::core::RationalU256;
 use ckb_types::{packed, prelude::*, H160, H256};
+use ckb_sdk::{
+    types::ScriptId,
+    traits::{
+        default_impls::{DefaultCellCollector, DefaultTransactionDependencyProvider, DefaultHeaderDepResolver},
+        offchain_impls::OffchainCellDepResolver,
+    },
+};
 use clap::crate_version;
 use common::lazy::{
     ACP_CODE_HASH, CHEQUE_CODE_HASH, DAO_CODE_HASH, PW_LOCK_CODE_HASH, SECP256K1_CODE_HASH,
@@ -42,9 +49,11 @@ use jsonrpsee_core::{Error, RpcResult};
 use parking_lot::RwLock;
 use pprof::ProfilerGuard;
 
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 lazy_static::lazy_static! {
     pub static ref PROFILER_GUARD: std::sync::Mutex<Option<ProfilerGuard<'static>>> = std::sync::Mutex::new(None);
@@ -66,6 +75,13 @@ pub struct MercuryRpcImpl<C> {
     storage: RelationalStorage,
     builtin_scripts: HashMap<String, ScriptInfo>,
     ckb_client: C,
+    cell_collector: Mutex<DefaultCellCollector>,
+    tx_dep_provider: DefaultTransactionDependencyProvider,
+    cell_dep_resolver: OffchainCellDepResolver,
+    header_dep_resolver: DefaultHeaderDepResolver,
+    axon_submit_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
+    axon_issue_asset_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
+    axon_cross_chain_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
     network_type: NetworkType,
     cheque_timeout: RationalU256,
     cellbase_maturity: RationalU256,
@@ -364,6 +380,8 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         storage: RelationalStorage,
         builtin_scripts: HashMap<String, ScriptInfo>,
         ckb_client: C,
+        ckb_uri: String,
+        ckb_indexer_uri: String,
         network_type: NetworkType,
         cheque_timeout: RationalU256,
         cellbase_maturity: RationalU256,
@@ -372,10 +390,36 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         is_pprof_enabled: bool,
     ) -> Self {
         load_code_hash(&builtin_scripts);
+        let (
+            cell_collector,
+            tx_dep_provider,
+            header_dep_resolver,
+        ) = tokio::task::block_in_place(move || (
+            Mutex::new(DefaultCellCollector::new(&ckb_indexer_uri, &ckb_uri)),
+            DefaultTransactionDependencyProvider::new(&ckb_uri, 0),
+            DefaultHeaderDepResolver::new(&ckb_uri),
+        ));
+
+        let cell_dep_resolver = OffchainCellDepResolver {
+            items: HashMap::from_iter(
+                       builtin_scripts.iter().map(|(name, info)| (
+                               ScriptId::from(&info.script),
+                               (info.cell_dep.clone(), name.clone()),
+                       )),
+                   ),
+        };
+
         MercuryRpcImpl {
             storage,
             builtin_scripts,
             ckb_client,
+            cell_collector,
+            tx_dep_provider,
+            cell_dep_resolver,
+            header_dep_resolver,
+            axon_submit_tx_cell_deps: OnceCell::new(),
+            axon_issue_asset_tx_cell_deps: OnceCell::new(),
+            axon_cross_chain_tx_cell_deps: OnceCell::new(),
             network_type,
             cheque_timeout,
             cellbase_maturity,

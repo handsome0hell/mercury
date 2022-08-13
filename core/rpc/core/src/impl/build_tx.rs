@@ -34,7 +34,7 @@ use core_rpc_types::{
 };
 use core_storage::Storage;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::slice::Iter;
 use std::str::FromStr;
@@ -1128,7 +1128,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         components: TransferComponents,
         payload_since: Option<SinceConfig>,
     ) -> InnerResult<(TransactionView, Vec<ScriptGroup>)> {
-        let cell_deps = self.build_cell_deps(components.script_deps)?;
+        let cell_deps = self.build_cell_deps(&components.script_deps)?;
         let inputs = self.build_transfer_tx_cell_inputs(
             &components.inputs,
             payload_since,
@@ -1188,13 +1188,14 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         Ok(updated_tx_view.into())
     }
 
-    fn build_cell_deps(&self, script_set: BTreeSet<String>) -> InnerResult<Vec<packed::CellDep>> {
+    pub(crate) fn build_cell_deps<'a, S: 'a + AsRef<str>, T>(&self, script_set: &'a T) -> InnerResult<Vec<packed::CellDep>> where &'a T: IntoIterator<Item = &'a S>{
         script_set
-            .iter()
+            .into_iter()
             .map(|s| {
+                let s_ref = s.as_ref();
                 self.builtin_scripts
-                    .get(s)
-                    .ok_or_else(|| CoreError::MissingScriptInfo(s.clone()).into())
+                    .get(s_ref)
+                    .ok_or_else(|| CoreError::MissingScriptInfo(s_ref.to_string()).into())
                     .map(|script_info| script_info.cell_dep.to_owned())
             })
             .collect::<Result<Vec<packed::CellDep>, _>>()
@@ -1476,7 +1477,7 @@ fn build_script_groups(
     script_groups.values().cloned().collect()
 }
 
-fn build_witnesses(
+pub(crate) fn build_witnesses(
     inputs_len: usize,
     script_groups: &[ScriptGroup],
     inputs_not_require_signature: &HashSet<usize>,

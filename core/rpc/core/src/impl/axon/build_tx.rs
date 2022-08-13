@@ -1,33 +1,33 @@
-use crate::r#impl::utils_types::TransferComponents;
 use crate::r#impl::MercuryRpcImpl;
+use crate::r#impl::build_tx::build_witnesses;
 use crate::{error::CoreError, InnerResult};
 
 use ckb_types::prelude::*;
-use ckb_types::H160;
-use ckb_types::{bytes::Bytes, core::TransactionView, packed};
+use ckb_types::{bytes::Bytes, packed};
 
-use ckb_types::core::Capacity;
+use ckb_types::core::{Capacity, TransactionView, FeeRate};
+use ckb_sdk::tx_builder::{
+    balance_tx_capacity, CapacityProvider, CapacityBalancer,
+};
 use common::utils::{decode_udt_amount, parse_address, to_fixed_array};
-use common::{Address, AddressPayload, Context, NetworkType, ACP, SECP256K1, SUDT};
+use common::{Context, ACP, SECP256K1, SUDT, PaginationRequest};
 use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, unpack_byte16, CrossChainTransferPayload, InitChainPayload, IssueAssetPayload,
     SubmitCheckpointPayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK,
     AXON_WITHDRAW_LOCK,
 };
-use core_rpc_types::consts::{BYTE_SHANNONS, OMNI_SCRIPT, TYPE_ID_SCRIPT};
-use core_rpc_types::{
-    HashAlgorithm, Item, SignAlgorithm, SignatureAction, SignatureInfo, SignatureLocation, Source,
-    TransactionCompletionResponse,
-};
+use core_rpc_types::consts::{BYTE_SHANNONS, OMNI_SCRIPT, DEFAULT_FEE_RATE};
+use core_rpc_types::TransactionCompletionResponse;
+
+use std::collections::{HashMap, HashSet};
 
 impl<C: CkbRpc> MercuryRpcImpl<C> {
     pub(crate) async fn prebuild_submit_tx(
         &self,
         ctx: Context,
         payload: SubmitCheckpointPayload,
-        fixed_fee: u64,
-    ) -> InnerResult<(TransactionView, Vec<SignatureAction>, usize)> {
+    ) -> InnerResult<TransactionCompletionResponse> {
         let input_selection_cell = self
             .get_live_cells(
                 ctx.clone(),
@@ -36,7 +36,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 vec![],
                 None,
                 None,
-                Default::default(),
+                PaginationRequest::default().limit(Some(1)),
             )
             .await?
             .response
@@ -52,7 +52,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 vec![payload.checkpoint_type_hash.clone()],
                 None,
                 None,
-                Default::default(),
+                PaginationRequest::default().limit(Some(1)),
             )
             .await?
             .response
@@ -116,7 +116,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
 
         let (output_withdraw_cell, output_withdraw_data) =
             if let Some(cell) = input_withdraw_cell.clone() {
-                let new_amount = decode_udt_amount(cell.cell_data.as_ref()) + base_reward;
+                let new_amount = decode_udt_amount(cell.cell_data.as_ref()).unwrap().checked_add(base_reward).unwrap();
                 let mut data = new_amount.to_le_bytes().to_vec();
                 data.extend_from_slice(&payload.period_number.to_le_bytes());
                 (cell.cell_output.clone(), Bytes::from(data))
@@ -126,94 +126,57 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 (withdraw_cell, data.into())
             };
 
-        let mut transfer_component = TransferComponents::new();
-        transfer_component.inputs.push(input_selection_cell);
-        transfer_component.inputs.push(input_checkpoint_cell);
-        if let Some(cell) = input_withdraw_cell.clone() {
-            transfer_component.inputs.push(cell)
+        let cell_deps = self.axon_submit_tx_cell_deps.get_or_init(||
+            self
+                .build_cell_deps(&[
+                    AXON_STAKE_LOCK,
+                    AXON_SELECTION_LOCK,
+                    SUDT,
+                    AXON_CHECKPOINT_LOCK,
+                    AXON_WITHDRAW_LOCK,
+                    SECP256K1,
+                ])
+                .expect("Failed to init axon submit tx cell deps")
+        ).clone();
+
+        let mut inputs = vec![input_selection_cell, input_checkpoint_cell];
+
+        if let Some(cell) = input_withdraw_cell {
+            inputs.push(cell.clone());
         }
-        transfer_component
-            .outputs
-            .push(output_selection_cell.cell_output);
-        transfer_component
-            .outputs_data
-            .push(output_selection_cell.cell_data.pack());
-        transfer_component
-            .outputs
-            .push(output_checkpoint_cell.cell_output);
-        transfer_component
-            .outputs_data
-            .push(output_checkpoint_cell.cell_data.pack());
-        transfer_component.outputs.push(output_withdraw_cell);
-        transfer_component
-            .outputs_data
-            .push(output_withdraw_data.pack());
-        transfer_component
-            .script_deps
-            .insert(AXON_STAKE_LOCK.to_string());
 
-        transfer_component
-            .script_deps
-            .insert(AXON_SELECTION_LOCK.to_string());
-        transfer_component.script_deps.insert(SUDT.to_string());
-        transfer_component
-            .script_deps
-            .insert(AXON_CHECKPOINT_LOCK.to_string());
-        transfer_component
-            .script_deps
-            .insert(AXON_WITHDRAW_LOCK.to_string());
-        transfer_component.script_deps.insert(SECP256K1.to_string());
-
-        self.balance_transfer_tx_capacity(
-            ctx.clone(),
-            vec![Item::Identity(payload.admin_id.try_into().unwrap())],
-            &mut transfer_component,
-            Some(fixed_fee),
-            None,
-        )
-        .await?;
-        let inputs = self.build_transfer_tx_cell_inputs(
-            &transfer_component.inputs,
-            None,
-            transfer_component.dao_since_map,
-            Source::Free,
-        )?;
-
-        let fee_change_cell_index = transfer_component
-            .fee_change_cell_index
-            .ok_or(CoreError::InvalidFeeChange)?;
-        let (tx_view, signature_actions) = self.prebuild_tx_complete(
-            inputs,
-            transfer_component.outputs,
-            transfer_component.outputs_data,
-            transfer_component.script_deps,
-            transfer_component.header_deps,
-            transfer_component.signature_actions,
-            transfer_component.type_witness_args,
-        )?;
-
-        let mut witnesses = unpack_output_data_vec(tx_view.witnesses());
-        witnesses[1] = packed::WitnessArgsBuilder::default()
-            .lock(Some(payload.checkpoint).pack())
-            .input_type(
-                packed::BytesOptBuilder::default()
-                    .set(Some(vec![1u8].pack()))
-                    .build(),
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(
+                self.build_transfer_tx_cell_inputs(
+                    &inputs,
+                    None,
+                    HashMap::default(),
+                )?,
             )
-            .build()
-            .as_bytes()
-            .pack();
+            .set_outputs(vec![
+                output_selection_cell.cell_output,
+                output_checkpoint_cell.cell_output,
+                output_withdraw_cell,
+            ])
+            .set_outputs_data(vec![
+                output_selection_cell.cell_data.pack(),
+                output_checkpoint_cell.cell_data.pack(),
+                output_withdraw_data.pack(),
+            ])
+            .set_cell_deps(cell_deps)
+            .build();
 
-        witnesses[2] = Bytes::new().pack();
+        let tx_view = self.balance_tx_capacity_by_identity(
+            ctx.clone(),
+            &tx_view,
+            FeeRate(DEFAULT_FEE_RATE),
+            payload.admin_id.try_into().unwrap(),
+        ).await?;
 
-        Ok((
-            tx_view
-                .as_advanced_builder()
-                .set_witnesses(witnesses)
-                .build()
-                .into(),
-            signature_actions,
-            fee_change_cell_index,
+        let script_grpups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_grpups,
         ))
     }
 
@@ -222,7 +185,6 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ctx: Context,
         payload: CrossChainTransferPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
-        let mut inputs = Vec::new();
         let sender = parse_address(&payload.sender)
             .map_err(|e| CoreError::ParseAddressError(e.to_string()))?;
         let receiver = parse_address(&payload.receiver)
@@ -275,10 +237,12 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .build();
         let user_sudt_amount = if payload.direction == 0 {
             decode_udt_amount(&input_user_cell.cell_data)
+                .unwrap()
                 .checked_add(amount)
                 .unwrap()
         } else {
             decode_udt_amount(&input_user_cell.cell_data)
+                .unwrap()
                 .checked_sub(amount)
                 .unwrap()
         };
@@ -286,99 +250,62 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         let output_relayer_cell = input_relayer_cell.cell_output.clone();
         let relayer_sudt_amount = if payload.direction == 0 {
             decode_udt_amount(&input_relayer_cell.cell_data)
+                .unwrap()
                 .checked_sub(amount)
                 .unwrap()
         } else {
             decode_udt_amount(&input_relayer_cell.cell_data)
+                .unwrap()
                 .checked_add(amount)
                 .unwrap()
         };
-        let output_releyer_cell_data = relayer_sudt_amount.to_le_bytes().to_vec();
+        let output_relayer_cell_data = relayer_sudt_amount.to_le_bytes().to_vec();
 
-        let sig_action_1 = SignatureAction {
-            signature_location: SignatureLocation {
-                index: 0,
-                offset: SignAlgorithm::Secp256k1.get_signature_offset().0,
-            },
-            signature_info: SignatureInfo {
-                algorithm: SignAlgorithm::Secp256k1,
-                address: payload.sender,
-            },
-            hash_algorithm: HashAlgorithm::Blake2b,
-            other_indexes_in_group: if payload.direction == 0 {
-                vec![2]
-            } else {
-                vec![]
-            },
-        };
+        let cell_deps = self.axon_cross_chain_tx_cell_deps.get_or_init(||
+            self
+                .build_cell_deps(&[ACP, SUDT])
+                .expect("Failed to init axon cross chain transfer tx cell deps")
+        ).clone();
 
-        let sig_action_2 = SignatureAction {
-            signature_location: SignatureLocation {
-                index: 1,
-                offset: SignAlgorithm::Secp256k1.get_signature_offset().0,
-            },
-            signature_info: SignatureInfo {
-                algorithm: SignAlgorithm::Secp256k1,
-                address: payload.receiver,
-            },
-            hash_algorithm: HashAlgorithm::Blake2b,
-            other_indexes_in_group: vec![2],
-        };
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(
+                self.build_transfer_tx_cell_inputs(
+                    &[input_user_cell, input_relayer_cell],
+                    None,
+                    HashMap::default(),
+                )?,
+            )
+            .set_outputs(vec![
+                output_relayer_cell,
+                output_user_cell,
+            ])
+            .set_outputs_data(vec![
+                output_relayer_cell_data.pack(),
+                output_user_cell_data.pack(),
+            ])
+            .set_cell_deps(cell_deps)
+            .build();
 
-        let mut transfer_component = TransferComponents::new();
-        inputs.push(
-            packed::CellInputBuilder::default()
-                .previous_output(input_user_cell.out_point.clone())
-                .build(),
+        let script_groups = self.get_tx_script_groups(&tx_view)?;
+
+        let mut witnesses = build_witnesses(
+            2,
+            &script_groups,
+            &HashSet::new(),
+            &HashMap::new(),
         );
-        inputs.push(
-            packed::CellInputBuilder::default()
-                .previous_output(input_relayer_cell.out_point)
-                .build(),
-        );
-        transfer_component.outputs.push(output_relayer_cell);
-        transfer_component
-            .outputs_data
-            .push(output_releyer_cell_data.pack());
-        transfer_component.outputs.push(output_user_cell);
-        transfer_component
-            .outputs_data
-            .push(output_user_cell_data.pack());
-        transfer_component.script_deps.insert(ACP.to_string());
-        transfer_component.script_deps.insert(SUDT.to_string());
-        transfer_component.signature_actions.insert(
-            input_user_cell.cell_output.calc_lock_hash().to_string(),
-            sig_action_1,
-        );
-        if payload.direction == 0 {
-            transfer_component.signature_actions.insert(
-                input_relayer_cell.cell_output.calc_lock_hash().to_string(),
-                sig_action_2,
-            );
-        }
-
-        let (tx_view, signature_actions) = self.prebuild_tx_complete(
-            inputs,
-            transfer_component.outputs,
-            transfer_component.outputs_data,
-            transfer_component.script_deps,
-            transfer_component.header_deps,
-            transfer_component.signature_actions,
-            transfer_component.type_witness_args,
-        )?;
-
-        let mut witnesses = unpack_output_data_vec(tx_view.witnesses());
         if payload.direction == 0 {
             witnesses.push(payload.memo.as_bytes().pack());
         }
 
+        let tx_view = tx_view
+            .as_advanced_builder()
+            .set_witnesses(witnesses)
+            .build();
+
         Ok(TransactionCompletionResponse::new(
-            tx_view
-                .as_advanced_builder()
-                .set_witnesses(witnesses)
-                .build()
-                .into(),
-            signature_actions,
+            tx_view.into(),
+            script_groups,
         ))
     }
 
@@ -386,8 +313,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         &self,
         ctx: Context,
         payload: IssueAssetPayload,
-        fixed_fee: u64,
-    ) -> InnerResult<(TransactionView, Vec<SignatureAction>, usize)> {
+    ) -> InnerResult<TransactionCompletionResponse> {
         let input_omni_cell = self
             .get_live_cells(
                 ctx.clone(),
@@ -396,7 +322,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 vec![payload.omni_type_hash.clone()],
                 None,
                 None,
-                Default::default(),
+                PaginationRequest::default().limit(Some(1)),
             )
             .await?
             .response
@@ -412,7 +338,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 vec![],
                 None,
                 None,
-                Default::default(),
+                PaginationRequest::default().limit(Some(1)),
             )
             .await?
             .response
@@ -447,84 +373,42 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 ))
                 .unwrap();
 
-        let admin_address = H160::from_slice(
-            &input_omni_cell
-                .cell_output
-                .lock()
-                .args()
-                .raw_data()
-                .to_vec()[1..21],
-        )
-        .unwrap();
-        let sig_action = SignatureAction {
-            signature_location: SignatureLocation {
-                index: 1,
-                offset: SignAlgorithm::Secp256k1.get_signature_offset().0 + 20,
-            },
-            signature_info: SignatureInfo {
-                algorithm: SignAlgorithm::Secp256k1,
-                address: Address::new(
-                    NetworkType::Testnet,
-                    AddressPayload::from_pubkey_hash(admin_address),
-                    true,
-                )
-                .to_string(),
-            },
-            hash_algorithm: HashAlgorithm::Blake2b,
-            other_indexes_in_group: vec![],
-        };
+        let cell_deps = self.axon_issue_asset_tx_cell_deps.get_or_init(||
+            self
+                .build_cell_deps(&[AXON_SELECTION_LOCK, OMNI_SCRIPT])
+                .expect("Failed to init axon issue asset tx cell deps")
+        ).clone();
 
-        let mut transfer_component = TransferComponents::new();
-        transfer_component.inputs.push(input_selection_cell.clone());
-        transfer_component.inputs.push(input_omni_cell.clone());
-        transfer_component
-            .outputs
-            .push(input_selection_cell.cell_output);
-        transfer_component.outputs_data.push(Default::default());
-        transfer_component
-            .outputs
-            .push(input_omni_cell.cell_output.clone());
-        transfer_component.outputs_data.push(omni_data.pack());
-        transfer_component.outputs.push(acp_cell);
-        transfer_component.outputs_data.push(acp_data.pack());
-        transfer_component.signature_actions.insert(
-            input_omni_cell.cell_output.calc_lock_hash().to_string(),
-            sig_action,
-        );
-        transfer_component
-            .script_deps
-            .insert(AXON_SELECTION_LOCK.to_string());
-        transfer_component
-            .script_deps
-            .insert(OMNI_SCRIPT.to_string());
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(
+                self.build_transfer_tx_cell_inputs(
+                    &[
+                        input_selection_cell.clone(),
+                        input_omni_cell.clone(),
+                    ],
+                    None,
+                    HashMap::default(),
+                )?,
+            )
+            .set_outputs(vec![
+                input_selection_cell.cell_output,
+                input_omni_cell.cell_output,
+                acp_cell,
+            ])
+            .set_outputs_data(vec![
+                Default::default(),
+                omni_data.pack(),
+                acp_data.pack(),
+            ])
+            .set_cell_deps(cell_deps)
+            .build();
 
-        self.balance_transfer_tx_capacity(
+        let tx_view = self.balance_tx_capacity_by_identity(
             ctx.clone(),
-            vec![Item::Identity(payload.admin_id.try_into().unwrap())],
-            &mut transfer_component,
-            Some(fixed_fee),
-            None,
-        )
-        .await?;
-        let inputs = self.build_transfer_tx_cell_inputs(
-            &transfer_component.inputs,
-            None,
-            transfer_component.dao_since_map,
-            Source::Free,
-        )?;
-
-        let fee_change_cell_index = transfer_component
-            .fee_change_cell_index
-            .ok_or(CoreError::InvalidFeeChange)?;
-        let (tx_view, signature_actions) = self.prebuild_tx_complete(
-            inputs,
-            transfer_component.outputs,
-            transfer_component.outputs_data,
-            transfer_component.script_deps,
-            transfer_component.header_deps,
-            transfer_component.signature_actions,
-            transfer_component.type_witness_args,
-        )?;
+            &tx_view,
+            FeeRate(DEFAULT_FEE_RATE),
+            payload.admin_id.try_into().unwrap(),
+        ).await?;
 
         let mut witnesses = unpack_output_data_vec(tx_view.witnesses());
         let omni_witness = generated::RcLockWitnessLockBuilder::default()
@@ -541,13 +425,15 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .as_bytes()
             .pack();
 
-        Ok((
-            tx_view
-                .as_advanced_builder()
-                .set_witnesses(witnesses)
-                .build(),
-            signature_actions,
-            fee_change_cell_index,
+        let tx_view = tx_view
+            .as_advanced_builder()
+            .set_witnesses(witnesses)
+            .build();
+
+        let script_groups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_groups,
         ))
     }
 
@@ -555,8 +441,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         &self,
         ctx: Context,
         payload: InitChainPayload,
-        fixed_fee: u64,
-    ) -> InnerResult<(TransactionView, Vec<SignatureAction>, usize)> {
+    ) -> InnerResult<TransactionCompletionResponse> {
         let (omni_cell, omni_cell_data) =
             self.build_omni_cell(payload.omni_config.clone(), payload.admin_id.clone())?;
         let (checkpoint_cell, checkpoint_cell_data) = self
@@ -566,173 +451,174 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         let selection_cell =
             self.build_selection_cell(checkpoint_cell.lock().calc_script_hash().unpack())?;
 
-        let mut transfer_component = TransferComponents::new();
-        transfer_component.outputs.push(selection_cell);
-        transfer_component.outputs_data.push(Default::default());
-        transfer_component.outputs.push(omni_cell);
-        transfer_component.outputs_data.push(omni_cell_data.pack());
-        transfer_component.outputs.push(checkpoint_cell);
-        transfer_component
-            .outputs_data
-            .push(checkpoint_cell_data.pack());
-        transfer_component.outputs.push(stake_cell);
-        transfer_component.outputs_data.push(stake_cell_data.pack());
+        let tx_view = TransactionView::new_advanced_builder()
+            .outputs(vec![
+                selection_cell.clone(),
+                omni_cell.clone(),
+                checkpoint_cell.clone(),
+                stake_cell.clone(),
+            ])
+            .outputs_data(vec![
+                Default::default(),
+                omni_cell_data.pack(),
+                checkpoint_cell_data.pack(),
+                stake_cell_data.pack(),
+            ])
+            .build();
 
-        self.balance_transfer_tx_capacity(
+        let tx_view = self.balance_tx_capacity_by_identity(
             ctx.clone(),
-            vec![Item::Identity(payload.admin_id.try_into().unwrap())],
-            &mut transfer_component,
-            Some(fixed_fee),
-            None,
+            &tx_view,
+            FeeRate(DEFAULT_FEE_RATE),
+            payload.admin_id.try_into().unwrap(),
         )
         .await?;
 
-        let inputs = self.build_transfer_tx_cell_inputs(
-            &transfer_component.inputs,
-            None,
-            transfer_component.dao_since_map,
-            Source::Free,
-        )?;
-        let first_input_cell = inputs.get(0).cloned().unwrap();
-        let fee_change_cell_index = transfer_component
-            .fee_change_cell_index
-            .ok_or(CoreError::InvalidFeeChange)?;
-        let (tx_view, signature_actions) = self.prebuild_tx_complete(
-            inputs,
-            transfer_component.outputs,
-            transfer_component.outputs_data,
-            transfer_component.script_deps,
-            transfer_component.header_deps,
-            transfer_component.signature_actions,
-            transfer_component.type_witness_args,
-        )?;
-
-        let mut output_cell_vec = unpack_output_vec(tx_view.outputs());
-        let mut output_cell_data_vec = unpack_output_data_vec(tx_view.outputs_data());
+        let first_input_cell = tx_view.inputs().get(0).unwrap();
 
         // Update omni cell
         let omni_type_script = self.build_type_id_script(&first_input_cell, 1)?;
         let omni_type_hash = omni_type_script.calc_script_hash();
-        output_cell_vec[1] = output_cell_vec[1]
-            .clone()
-            .as_builder()
-            .type_(Some(omni_type_script).pack())
-            .build();
-        let mut omni_lock_args = tx_view.output(1).unwrap().lock().args().raw_data().to_vec();
+        let mut omni_lock_args = omni_cell.lock().args().raw_data().to_vec();
         omni_lock_args[22..].swap_with_slice(&mut omni_type_hash.raw_data().to_vec());
-        let omni_lock = output_cell_vec[1]
+        let omni_lock = omni_cell
             .lock()
             .as_builder()
             .args(omni_lock_args.pack())
             .build();
-        output_cell_vec[1] = output_cell_vec[1]
-            .clone()
+        let omni_cell = omni_cell
             .as_builder()
+            .type_(Some(omni_type_script).pack())
             .lock(omni_lock)
             .build();
 
         // Update checkpoint cell
         let checkpoint_type_script = self.build_type_id_script(&first_input_cell, 2)?;
         let checkpoint_type_hash = checkpoint_type_script.calc_script_hash();
-        output_cell_vec[2] = output_cell_vec[2]
-            .clone()
-            .as_builder()
-            .type_(Some(checkpoint_type_script).pack())
-            .build();
-        let checkpoint_lock_args = tx_view.output(2).unwrap().lock().args().raw_data();
+        let checkpoint_lock_args = checkpoint_cell.lock().args().raw_data();
         let new_args = generated::CheckpointLockArgs::new_unchecked(checkpoint_lock_args)
             .as_builder()
             .type_id_hash(checkpoint_type_hash.into())
             .build();
-        let checkpoint_lock = output_cell_vec[2]
+        let checkpoint_lock = checkpoint_cell
             .lock()
             .as_builder()
             .args(new_args.as_bytes().pack())
             .build();
-        output_cell_vec[2] = output_cell_vec[2]
-            .clone()
+        let checkpoint_cell = checkpoint_cell
             .as_builder()
             .lock(checkpoint_lock)
+            .type_(Some(checkpoint_type_script).pack())
             .build();
 
         // Update stake cell
         let stake_type_script = self.build_type_id_script(&first_input_cell, 3)?;
         let stake_type_hash = stake_type_script.calc_script_hash();
-        output_cell_vec[3] = output_cell_vec[3]
-            .clone()
-            .as_builder()
-            .type_(Some(stake_type_script).pack())
-            .build();
-        let stake_lock_args = tx_view.output(3).unwrap().lock().args().raw_data();
+        let stake_lock_args = stake_cell.lock().args().raw_data();
         let new_args = generated::StakeLockArgs::new_unchecked(stake_lock_args)
             .as_builder()
             .type_id_hash(stake_type_hash.clone().into())
             .build();
-        let stake_lock_script = output_cell_vec[3]
+        let stake_lock_script = stake_cell
             .lock()
             .as_builder()
             .args(new_args.as_bytes().pack())
             .build();
-        output_cell_vec[3] = output_cell_vec[3]
-            .clone()
+        let stake_cell = stake_cell
             .as_builder()
+            .type_(Some(stake_type_script).pack())
             .lock(stake_lock_script)
             .build();
 
         // Update selection cell
-        let omni_lock_hash = output_cell_vec[1].lock().calc_script_hash();
-        let checkpoint_lock_hash = output_cell_vec[2].lock().calc_script_hash();
+        let omni_lock_hash = omni_cell.lock().calc_script_hash();
+        let checkpoint_lock_hash = checkpoint_cell.lock().calc_script_hash();
         let new_args = generated::SelectionLockArgsBuilder::default()
             .omni_lock_hash(omni_lock_hash.into())
             .checkpoint_lock_hash(checkpoint_lock_hash.into())
             .build();
-        let selection_lock_script = output_cell_vec[0]
+        let selection_lock_script = selection_cell
             .lock()
             .as_builder()
             .args(new_args.as_bytes().pack())
             .build();
-        output_cell_vec[0] = output_cell_vec[0]
-            .clone()
+        let selection_cell = selection_cell
             .as_builder()
             .lock(selection_lock_script)
             .build();
 
-        let sudt_args = output_cell_vec[0].lock().calc_script_hash();
+        let sudt_args = selection_cell.lock().calc_script_hash();
         let sudt_type_hash = self.build_sudt_script(sudt_args).calc_script_hash();
 
         // Updata omni data
-        let mut omni_data = tx_view.outputs_data().get_unchecked(1).raw_data().to_vec();
-        omni_data[33..].swap_with_slice(&mut sudt_type_hash.raw_data().to_vec());
-        output_cell_data_vec[1] = omni_data.pack();
+        let mut omni_cell_data = omni_cell_data.to_vec();
+        omni_cell_data[33..].swap_with_slice(&mut sudt_type_hash.raw_data().to_vec());
 
         // Update checkpoint data
-        let checkpoint_data = tx_view.outputs_data().get_unchecked(2).raw_data();
-        let new_data = generated::CheckpointLockCellData::new_unchecked(checkpoint_data)
+        let checkpoint_cell_data = generated::CheckpointLockCellData::new_unchecked(checkpoint_cell_data)
             .as_builder()
             .sudt_type_hash(sudt_type_hash.clone().into())
             .stake_type_hash(stake_type_hash.clone().into())
             .build()
             .as_bytes();
-        output_cell_data_vec[2] = new_data.pack();
 
         // Updata stake data
-        let stake_data = tx_view.outputs_data().get_unchecked(3).raw_data();
-        let new_data = generated::StakeLockCellData::new_unchecked(stake_data)
+        let stake_cell_data = generated::StakeLockCellData::new_unchecked(stake_cell_data)
             .as_builder()
             .sudt_type_hash(sudt_type_hash.into())
             .build()
             .as_bytes();
-        output_cell_data_vec[3] = new_data.pack();
 
-        Ok((
-            tx_view
-                .as_advanced_builder()
-                .set_outputs(output_cell_vec)
-                .set_outputs_data(output_cell_data_vec)
-                .build(),
-            signature_actions,
-            fee_change_cell_index,
+        let tx_view = tx_view
+            .as_advanced_builder()
+            .outputs(vec![
+                selection_cell,
+                omni_cell,
+                checkpoint_cell,
+                stake_cell,
+            ])
+            .outputs_data(vec![
+                Default::default(),
+                omni_cell_data.pack(),
+                checkpoint_cell_data.pack(),
+                stake_cell_data.pack(),
+            ])
+            .build();
+
+        let script_groups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_groups,
         ))
+    }
+
+    async fn balance_tx_capacity_by_identity(&self, ctx: Context, tx_view: &TransactionView, fee_rate: FeeRate, identity: core_rpc_types::Identity) -> InnerResult<TransactionView> {
+        let scripts = self.get_scripts_by_identity(
+            ctx.clone(),
+            identity,
+            None,
+        ).await?
+            .iter()
+            .map(|script| (script.clone(), packed::WitnessArgs::default()))
+            .collect();
+
+        Ok(
+            tokio::task::block_in_place(
+                || balance_tx_capacity(
+                    &tx_view,
+                    &CapacityBalancer {
+                        fee_rate,
+                        capacity_provider: CapacityProvider::new(scripts),
+                        change_lock_script: None,
+                        force_small_change_as_fee: None,
+                    },
+                    &mut *self.cell_collector.lock().unwrap(),
+                    &self.tx_dep_provider,
+                    &self.cell_dep_resolver,
+                    &self.header_dep_resolver,
+                ).map_err(CoreError::from)
+            )?
+        )
     }
 }
 
@@ -745,11 +631,6 @@ fn build_bytes_opt(input: Bytes) -> Option<generated::Bytes> {
     let bytes = generated::BytesBuilder::default().extend(bytes).build();
     Some(bytes)
 }
-
-fn unpack_output_vec(outputs: packed::CellOutputVec) -> Vec<packed::CellOutput> {
-    outputs.into_iter().collect()
-}
-
 fn unpack_output_data_vec(outputs_data: packed::BytesVec) -> Vec<packed::Bytes> {
     outputs_data.into_iter().collect()
 }

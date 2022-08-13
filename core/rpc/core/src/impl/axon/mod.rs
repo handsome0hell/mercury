@@ -1,7 +1,6 @@
 mod build_tx;
 
 use crate::r#impl::MercuryRpcImpl;
-use crate::MercuryRpcServer;
 use crate::{error::CoreError, InnerResult};
 
 use ckb_types::core::ScriptHashType;
@@ -26,8 +25,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ctx: Context,
         payload: SubmitCheckpointPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
-        self.build_transaction_with_adjusted_fee(Self::prebuild_submit_tx, ctx, payload, None)
-            .await
+        self.prebuild_submit_tx(ctx, payload).await
     }
 
     pub(crate) async fn inner_issue_asset(
@@ -35,8 +33,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ctx: Context,
         payload: IssueAssetPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
-        self.build_transaction_with_adjusted_fee(Self::prebuild_issue_asset_tx, ctx, payload, None)
-            .await
+        self.prebuild_issue_asset_tx(ctx, payload).await
     }
 
     pub(crate) async fn inner_init_side_chain(
@@ -44,14 +41,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ctx: Context,
         payload: InitChainPayload,
     ) -> InnerResult<InitChainResponse> {
-        let tx = self
-            .build_transaction_with_adjusted_fee(
-                Self::prebuild_init_axon_chain_tx,
-                ctx,
-                payload,
-                None,
-            )
-            .await?;
+        let tx = self.prebuild_init_axon_chain_tx(ctx, payload).await?;
 
         let tx_view: packed::Transaction = tx.tx_view.inner.clone().into();
         let tx_view = tx_view.into_view();

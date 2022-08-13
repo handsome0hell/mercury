@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::HashSet;
+use std::num::TryFromIntError;
 
 pub const SECP256K1_WITNESS_LOCATION: (u32, u32) = (20, 65); // (offset, length)
 
@@ -444,6 +445,15 @@ pub enum ScriptGroupType {
     Type,
 }
 
+impl From<ckb_sdk::types::ScriptGroupType> for ScriptGroupType {
+    fn from(sgt: ckb_sdk::types::ScriptGroupType) -> ScriptGroupType {
+        match sgt {
+            ckb_sdk::types::ScriptGroupType::Lock => Self::Lock,
+            ckb_sdk::types::ScriptGroupType::Type => Self::Type,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ScriptGroup {
     pub script: Script,
@@ -459,6 +469,25 @@ impl ScriptGroup {
 
     pub fn add_group_outputs(&mut self, index: u32) {
         self.output_indices.push(index.into())
+    }
+}
+
+fn try_usize_vec_into_uint32_vec(ori: Vec<usize>) -> Result<Vec<Uint32>, TryFromIntError> {
+    ori
+        .iter()
+        .map(|i| -> Result<_, _> { Ok(u32::try_from(*i)?.into()) })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+impl TryFrom<ckb_sdk::types::ScriptGroup> for ScriptGroup {
+    type Error = TryFromIntError;
+    fn try_from(sg: ckb_sdk::types::ScriptGroup) -> Result<Self, TryFromIntError> {
+        Ok(Self {
+            script: sg.script.into(),
+            group_type: sg.group_type.into(),
+            input_indices: try_usize_vec_into_uint32_vec(sg.input_indices)?,
+            output_indices: try_usize_vec_into_uint32_vec(sg.output_indices)?,
+        })
     }
 }
 
