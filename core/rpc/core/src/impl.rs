@@ -15,15 +15,17 @@ use crate::r#impl::build_tx::calculate_tx_size;
 use crate::{error::CoreError, MercuryRpcServer};
 
 use ckb_jsonrpc_types::Uint64;
-use ckb_types::core::RationalU256;
-use ckb_types::{packed, prelude::*, H160, H256};
 use ckb_sdk::{
-    types::ScriptId,
     traits::{
-        default_impls::{DefaultCellCollector, DefaultTransactionDependencyProvider, DefaultHeaderDepResolver},
+        default_impls::{
+            DefaultCellCollector, DefaultHeaderDepResolver, DefaultTransactionDependencyProvider,
+        },
         offchain_impls::OffchainCellDepResolver,
     },
+    types::ScriptId,
 };
+use ckb_types::core::RationalU256;
+use ckb_types::{packed, prelude::*, H160, H256};
 use clap::crate_version;
 use common::lazy::{
     ACP_CODE_HASH, CHEQUE_CODE_HASH, DAO_CODE_HASH, PW_LOCK_CODE_HASH, SECP256K1_CODE_HASH,
@@ -390,23 +392,22 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         is_pprof_enabled: bool,
     ) -> Self {
         load_code_hash(&builtin_scripts);
-        let (
-            cell_collector,
-            tx_dep_provider,
-            header_dep_resolver,
-        ) = tokio::task::block_in_place(move || (
-            Mutex::new(DefaultCellCollector::new(&ckb_indexer_uri, &ckb_uri)),
-            DefaultTransactionDependencyProvider::new(&ckb_uri, 0),
-            DefaultHeaderDepResolver::new(&ckb_uri),
-        ));
+        let (cell_collector, tx_dep_provider, header_dep_resolver) =
+            tokio::task::block_in_place(move || {
+                (
+                    Mutex::new(DefaultCellCollector::new(&ckb_indexer_uri, &ckb_uri)),
+                    DefaultTransactionDependencyProvider::new(&ckb_uri, 0),
+                    DefaultHeaderDepResolver::new(&ckb_uri),
+                )
+            });
 
         let cell_dep_resolver = OffchainCellDepResolver {
-            items: HashMap::from_iter(
-                       builtin_scripts.iter().map(|(name, info)| (
-                               ScriptId::from(&info.script),
-                               (info.cell_dep.clone(), name.clone()),
-                       )),
-                   ),
+            items: HashMap::from_iter(builtin_scripts.iter().map(|(name, info)| {
+                (
+                    ScriptId::from(&info.script),
+                    (info.cell_dep.clone(), name.clone()),
+                )
+            })),
         };
 
         MercuryRpcImpl {

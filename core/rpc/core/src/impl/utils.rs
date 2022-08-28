@@ -2,9 +2,11 @@ use crate::r#impl::{address_to_script, utils_types::*};
 use crate::{error::CoreError, InnerResult, MercuryRpcImpl};
 
 use ckb_dao_utils::extract_dao_data;
-use ckb_types::core::{BlockNumber, Capacity, EpochNumberWithFraction, RationalU256, TransactionView};
-use ckb_types::{bytes::Bytes, packed, prelude::*, H160, H256, U256};
 use ckb_sdk::tx_builder::gen_script_groups;
+use ckb_types::core::{
+    BlockNumber, Capacity, EpochNumberWithFraction, RationalU256, TransactionView,
+};
+use ckb_types::{bytes::Bytes, packed, prelude::*, H160, H256, U256};
 use common::address::{is_acp, is_pw_lock, is_secp256k1};
 use common::hash::{blake2b_160, blake2b_256_to_160};
 use common::lazy::{
@@ -26,7 +28,7 @@ use core_rpc_types::lazy::{CURRENT_EPOCH_NUMBER, TX_POOL_CACHE};
 use core_rpc_types::{lazy::CURRENT_BLOCK_NUMBER, DaoInfo};
 use core_rpc_types::{
     AssetInfo, AssetType, Balance, DaoState, ExtraFilter, ExtraType, IOType, Identity,
-    IdentityFlag, Item, JsonItem, Record, SinceConfig, SinceFlag, SinceType, ScriptGroup,
+    IdentityFlag, Item, JsonItem, Record, ScriptGroup, SinceConfig, SinceFlag, SinceType,
 };
 use core_storage::{Storage, TransactionWrapper};
 use num_bigint::{BigInt, BigUint};
@@ -2575,10 +2577,15 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         Err(CoreError::UnsupportLockScript(hex::encode(script.code_hash().as_slice())).into())
     }
 
-    pub(crate) fn get_tx_script_groups(&self, tx: &TransactionView) -> Result<Vec<ScriptGroup>, CoreError> {
-        let script_groups = tokio::task::block_in_place(|| gen_script_groups(tx, &self.tx_dep_provider))?;
+    pub(crate) fn get_tx_script_groups(
+        &self,
+        tx: &TransactionView,
+    ) -> Result<Vec<ScriptGroup>, CoreError> {
+        let script_groups =
+            tokio::task::block_in_place(|| gen_script_groups(tx, &self.tx_dep_provider))?;
 
-        script_groups.lock_groups
+        script_groups
+            .lock_groups
             .into_values()
             .chain(script_groups.type_groups.into_values())
             .map(ScriptGroup::try_from)

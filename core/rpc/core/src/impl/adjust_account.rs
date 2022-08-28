@@ -17,7 +17,6 @@ use core_rpc_types::{
     Item, ScriptGroup, TransactionCompletionResponse,
 };
 
-
 use std::collections::{BTreeSet, HashSet};
 use std::convert::TryInto;
 

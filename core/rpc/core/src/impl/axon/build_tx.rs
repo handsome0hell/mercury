@@ -1,23 +1,21 @@
-use crate::r#impl::MercuryRpcImpl;
 use crate::r#impl::build_tx::build_witnesses;
+use crate::r#impl::MercuryRpcImpl;
 use crate::{error::CoreError, InnerResult};
 
 use ckb_types::prelude::*;
 use ckb_types::{bytes::Bytes, packed};
 
-use ckb_types::core::{Capacity, TransactionView, FeeRate};
-use ckb_sdk::tx_builder::{
-    balance_tx_capacity, CapacityProvider, CapacityBalancer,
-};
+use ckb_sdk::tx_builder::{balance_tx_capacity, CapacityBalancer, CapacityProvider};
+use ckb_types::core::{Capacity, FeeRate, TransactionView};
 use common::utils::{decode_udt_amount, parse_address, to_fixed_array};
-use common::{Context, ACP, SECP256K1, SUDT, PaginationRequest};
+use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, unpack_byte16, CrossChainTransferPayload, InitChainPayload, IssueAssetPayload,
     SubmitCheckpointPayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK,
     AXON_WITHDRAW_LOCK,
 };
-use core_rpc_types::consts::{BYTE_SHANNONS, OMNI_SCRIPT, DEFAULT_FEE_RATE};
+use core_rpc_types::consts::{BYTE_SHANNONS, DEFAULT_FEE_RATE, OMNI_SCRIPT};
 use core_rpc_types::TransactionCompletionResponse;
 
 use std::collections::{HashMap, HashSet};
@@ -116,7 +114,10 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
 
         let (output_withdraw_cell, output_withdraw_data) =
             if let Some(cell) = input_withdraw_cell.clone() {
-                let new_amount = decode_udt_amount(cell.cell_data.as_ref()).unwrap().checked_add(base_reward).unwrap();
+                let new_amount = decode_udt_amount(cell.cell_data.as_ref())
+                    .unwrap()
+                    .checked_add(base_reward)
+                    .unwrap();
                 let mut data = new_amount.to_le_bytes().to_vec();
                 data.extend_from_slice(&payload.period_number.to_le_bytes());
                 (cell.cell_output.clone(), Bytes::from(data))
@@ -126,9 +127,10 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 (withdraw_cell, data.into())
             };
 
-        let cell_deps = self.axon_submit_tx_cell_deps.get_or_init(||
-            self
-                .build_cell_deps(&[
+        let cell_deps = self
+            .axon_submit_tx_cell_deps
+            .get_or_init(|| {
+                self.build_cell_deps(&[
                     AXON_STAKE_LOCK,
                     AXON_SELECTION_LOCK,
                     SUDT,
@@ -137,7 +139,8 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                     SECP256K1,
                 ])
                 .expect("Failed to init axon submit tx cell deps")
-        ).clone();
+            })
+            .clone();
 
         let mut inputs = vec![input_selection_cell, input_checkpoint_cell];
 
@@ -146,13 +149,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         }
 
         let tx_view = TransactionView::new_advanced_builder()
-            .set_inputs(
-                self.build_transfer_tx_cell_inputs(
-                    &inputs,
-                    None,
-                    HashMap::default(),
-                )?,
-            )
+            .set_inputs(self.build_transfer_tx_cell_inputs(&inputs, None, HashMap::default())?)
             .set_outputs(vec![
                 output_selection_cell.cell_output,
                 output_checkpoint_cell.cell_output,
@@ -166,12 +163,14 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .set_cell_deps(cell_deps)
             .build();
 
-        let tx_view = self.balance_tx_capacity_by_identity(
-            ctx.clone(),
-            &tx_view,
-            FeeRate(DEFAULT_FEE_RATE),
-            payload.admin_id.try_into().unwrap(),
-        ).await?;
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                payload.admin_id.try_into().unwrap(),
+            )
+            .await?;
 
         let script_grpups = self.get_tx_script_groups(&tx_view)?;
         Ok(TransactionCompletionResponse::new(
@@ -261,24 +260,21 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         };
         let output_relayer_cell_data = relayer_sudt_amount.to_le_bytes().to_vec();
 
-        let cell_deps = self.axon_cross_chain_tx_cell_deps.get_or_init(||
-            self
-                .build_cell_deps(&[ACP, SUDT])
-                .expect("Failed to init axon cross chain transfer tx cell deps")
-        ).clone();
+        let cell_deps = self
+            .axon_cross_chain_tx_cell_deps
+            .get_or_init(|| {
+                self.build_cell_deps(&[ACP, SUDT])
+                    .expect("Failed to init axon cross chain transfer tx cell deps")
+            })
+            .clone();
 
         let tx_view = TransactionView::new_advanced_builder()
-            .set_inputs(
-                self.build_transfer_tx_cell_inputs(
-                    &[input_user_cell, input_relayer_cell],
-                    None,
-                    HashMap::default(),
-                )?,
-            )
-            .set_outputs(vec![
-                output_relayer_cell,
-                output_user_cell,
-            ])
+            .set_inputs(self.build_transfer_tx_cell_inputs(
+                &[input_user_cell, input_relayer_cell],
+                None,
+                HashMap::default(),
+            )?)
+            .set_outputs(vec![output_relayer_cell, output_user_cell])
             .set_outputs_data(vec![
                 output_relayer_cell_data.pack(),
                 output_user_cell_data.pack(),
@@ -288,12 +284,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
 
         let script_groups = self.get_tx_script_groups(&tx_view)?;
 
-        let mut witnesses = build_witnesses(
-            2,
-            &script_groups,
-            &HashSet::new(),
-            &HashMap::new(),
-        );
+        let mut witnesses = build_witnesses(2, &script_groups, &HashSet::new(), &HashMap::new());
         if payload.direction == 0 {
             witnesses.push(payload.memo.as_bytes().pack());
         }
@@ -373,42 +364,37 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 ))
                 .unwrap();
 
-        let cell_deps = self.axon_issue_asset_tx_cell_deps.get_or_init(||
-            self
-                .build_cell_deps(&[AXON_SELECTION_LOCK, OMNI_SCRIPT])
-                .expect("Failed to init axon issue asset tx cell deps")
-        ).clone();
+        let cell_deps = self
+            .axon_issue_asset_tx_cell_deps
+            .get_or_init(|| {
+                self.build_cell_deps(&[AXON_SELECTION_LOCK, OMNI_SCRIPT])
+                    .expect("Failed to init axon issue asset tx cell deps")
+            })
+            .clone();
 
         let tx_view = TransactionView::new_advanced_builder()
-            .set_inputs(
-                self.build_transfer_tx_cell_inputs(
-                    &[
-                        input_selection_cell.clone(),
-                        input_omni_cell.clone(),
-                    ],
-                    None,
-                    HashMap::default(),
-                )?,
-            )
+            .set_inputs(self.build_transfer_tx_cell_inputs(
+                &[input_selection_cell.clone(), input_omni_cell.clone()],
+                None,
+                HashMap::default(),
+            )?)
             .set_outputs(vec![
                 input_selection_cell.cell_output,
                 input_omni_cell.cell_output,
                 acp_cell,
             ])
-            .set_outputs_data(vec![
-                Default::default(),
-                omni_data.pack(),
-                acp_data.pack(),
-            ])
+            .set_outputs_data(vec![Default::default(), omni_data.pack(), acp_data.pack()])
             .set_cell_deps(cell_deps)
             .build();
 
-        let tx_view = self.balance_tx_capacity_by_identity(
-            ctx.clone(),
-            &tx_view,
-            FeeRate(DEFAULT_FEE_RATE),
-            payload.admin_id.try_into().unwrap(),
-        ).await?;
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                payload.admin_id.try_into().unwrap(),
+            )
+            .await?;
 
         let mut witnesses = unpack_output_data_vec(tx_view.witnesses());
         let omni_witness = generated::RcLockWitnessLockBuilder::default()
@@ -466,13 +452,14 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             ])
             .build();
 
-        let tx_view = self.balance_tx_capacity_by_identity(
-            ctx.clone(),
-            &tx_view,
-            FeeRate(DEFAULT_FEE_RATE),
-            payload.admin_id.try_into().unwrap(),
-        )
-        .await?;
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                payload.admin_id.try_into().unwrap(),
+            )
+            .await?;
 
         let first_input_cell = tx_view.inputs().get(0).unwrap();
 
@@ -555,12 +542,13 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         omni_cell_data[33..].swap_with_slice(&mut sudt_type_hash.raw_data().to_vec());
 
         // Update checkpoint data
-        let checkpoint_cell_data = generated::CheckpointLockCellData::new_unchecked(checkpoint_cell_data)
-            .as_builder()
-            .sudt_type_hash(sudt_type_hash.clone().into())
-            .stake_type_hash(stake_type_hash.clone().into())
-            .build()
-            .as_bytes();
+        let checkpoint_cell_data =
+            generated::CheckpointLockCellData::new_unchecked(checkpoint_cell_data)
+                .as_builder()
+                .sudt_type_hash(sudt_type_hash.clone().into())
+                .stake_type_hash(stake_type_hash.clone().into())
+                .build()
+                .as_bytes();
 
         // Updata stake data
         let stake_cell_data = generated::StakeLockCellData::new_unchecked(stake_cell_data)
@@ -571,12 +559,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
 
         let tx_view = tx_view
             .as_advanced_builder()
-            .outputs(vec![
-                selection_cell,
-                omni_cell,
-                checkpoint_cell,
-                stake_cell,
-            ])
+            .outputs(vec![selection_cell, omni_cell, checkpoint_cell, stake_cell])
             .outputs_data(vec![
                 Default::default(),
                 omni_cell_data.pack(),
@@ -592,33 +575,36 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ))
     }
 
-    async fn balance_tx_capacity_by_identity(&self, ctx: Context, tx_view: &TransactionView, fee_rate: FeeRate, identity: core_rpc_types::Identity) -> InnerResult<TransactionView> {
-        let scripts = self.get_scripts_by_identity(
-            ctx.clone(),
-            identity,
-            None,
-        ).await?
+    async fn balance_tx_capacity_by_identity(
+        &self,
+        ctx: Context,
+        tx_view: &TransactionView,
+        fee_rate: FeeRate,
+        identity: core_rpc_types::Identity,
+    ) -> InnerResult<TransactionView> {
+        let scripts = self
+            .get_scripts_by_identity(ctx.clone(), identity, None)
+            .await?
             .iter()
             .map(|script| (script.clone(), packed::WitnessArgs::default()))
             .collect();
 
-        Ok(
-            tokio::task::block_in_place(
-                || balance_tx_capacity(
-                    &tx_view,
-                    &CapacityBalancer {
-                        fee_rate,
-                        capacity_provider: CapacityProvider::new(scripts),
-                        change_lock_script: None,
-                        force_small_change_as_fee: None,
-                    },
-                    &mut *self.cell_collector.lock().unwrap(),
-                    &self.tx_dep_provider,
-                    &self.cell_dep_resolver,
-                    &self.header_dep_resolver,
-                ).map_err(CoreError::from)
-            )?
-        )
+        Ok(tokio::task::block_in_place(|| {
+            balance_tx_capacity(
+                &tx_view,
+                &CapacityBalancer {
+                    fee_rate,
+                    capacity_provider: CapacityProvider::new(scripts),
+                    change_lock_script: None,
+                    force_small_change_as_fee: None,
+                },
+                &mut *self.cell_collector.lock().unwrap(),
+                &self.tx_dep_provider,
+                &self.cell_dep_resolver,
+                &self.header_dep_resolver,
+            )
+            .map_err(CoreError::from)
+        })?)
     }
 }
 

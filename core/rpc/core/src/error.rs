@@ -1,10 +1,7 @@
 use common::derive_more::Display;
 use core_rpc_types::error::{MercuryRpcError, RpcError};
 
-use ckb_sdk::{
-    traits::TransactionDependencyError,
-    tx_builder::BalanceTxCapacityError,
-};
+use ckb_sdk::{traits::TransactionDependencyError, tx_builder::BalanceTxCapacityError};
 
 use serde::{Deserialize, Serialize};
 

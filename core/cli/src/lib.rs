@@ -135,7 +135,10 @@ impl<'a> Cli<'a> {
             self.config.to_script_map(),
             self.config.cellbase_maturity,
             self.parse_cmd_args("ckb_uri", self.config.network_config.ckb_uri.clone()),
-            self.parse_cmd_args("ckb_indexer_uri", self.config.network_config.ckb_indexer_uri.clone()),
+            self.parse_cmd_args(
+                "ckb_indexer_uri",
+                self.config.network_config.ckb_indexer_uri.clone(),
+            ),
             self.config.cheque_since,
             LevelFilter::from_str(&self.config.db_config.db_log_level).expect("parse log level"),
             self.config.pool_cache_size,

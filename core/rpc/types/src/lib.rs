@@ -473,8 +473,7 @@ impl ScriptGroup {
 }
 
 fn try_usize_vec_into_uint32_vec(ori: Vec<usize>) -> Result<Vec<Uint32>, TryFromIntError> {
-    ori
-        .iter()
+    ori.iter()
         .map(|i| -> Result<_, _> { Ok(u32::try_from(*i)?.into()) })
         .collect::<Result<Vec<_>, _>>()
 }

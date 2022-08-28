@@ -1188,7 +1188,13 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         Ok(updated_tx_view.into())
     }
 
-    pub(crate) fn build_cell_deps<'a, S: 'a + AsRef<str>, T>(&self, script_set: &'a T) -> InnerResult<Vec<packed::CellDep>> where &'a T: IntoIterator<Item = &'a S>{
+    pub(crate) fn build_cell_deps<'a, S: 'a + AsRef<str>, T>(
+        &self,
+        script_set: &'a T,
+    ) -> InnerResult<Vec<packed::CellDep>>
+    where
+        &'a T: IntoIterator<Item = &'a S>,
+    {
         script_set
             .into_iter()
             .map(|s| {
