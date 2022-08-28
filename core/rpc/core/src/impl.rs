@@ -8,7 +8,7 @@ pub(crate) mod utils_types;
 
 use core_rpc_types::axon::{
     CrossChainTransferPayload, InitChainPayload, InitChainResponse, IssueAssetPayload,
-    SubmitCheckpointPayload,
+    SubmitCheckpointPayload, UpdateStakePayload,
 };
 
 use crate::r#impl::build_tx::calculate_tx_size;
@@ -16,6 +16,7 @@ use crate::{error::CoreError, MercuryRpcServer};
 
 use ckb_jsonrpc_types::Uint64;
 use ckb_sdk::{
+    rpc::ckb_indexer::IndexerRpcClient,
     traits::{
         default_impls::{
             DefaultCellCollector, DefaultHeaderDepResolver, DefaultTransactionDependencyProvider,
@@ -77,6 +78,7 @@ pub struct MercuryRpcImpl<C> {
     storage: RelationalStorage,
     builtin_scripts: HashMap<String, ScriptInfo>,
     ckb_client: C,
+    ckb_indexer_client: Mutex<IndexerRpcClient>,
     cell_collector: Mutex<DefaultCellCollector>,
     tx_dep_provider: DefaultTransactionDependencyProvider,
     cell_dep_resolver: OffchainCellDepResolver,
@@ -84,6 +86,7 @@ pub struct MercuryRpcImpl<C> {
     axon_submit_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
     axon_issue_asset_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
     axon_cross_chain_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
+    axon_update_stake_tx_cell_deps: OnceCell<Vec<packed::CellDep>>,
     network_type: NetworkType,
     cheque_timeout: RationalU256,
     cellbase_maturity: RationalU256,
@@ -132,6 +135,13 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         payload: TransferPayload,
     ) -> RpcResult<TransactionCompletionResponse> {
         rpc_impl!(self, inner_build_transfer_transaction, payload)
+    }
+
+    async fn build_update_stake_transaction(
+        &self,
+        payload: UpdateStakePayload,
+    ) -> RpcResult<TransactionCompletionResponse> {
+        rpc_impl!(self, inner_update_stake, payload)
     }
 
     async fn build_init_side_chain_transaction(
@@ -393,7 +403,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
     ) -> Self {
         load_code_hash(&builtin_scripts);
         let (cell_collector, tx_dep_provider, header_dep_resolver) =
-            tokio::task::block_in_place(move || {
+            tokio::task::block_in_place(|| {
                 (
                     Mutex::new(DefaultCellCollector::new(&ckb_indexer_uri, &ckb_uri)),
                     DefaultTransactionDependencyProvider::new(&ckb_uri, 0),
@@ -414,6 +424,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             storage,
             builtin_scripts,
             ckb_client,
+            ckb_indexer_client: Mutex::new(IndexerRpcClient::new(&ckb_indexer_uri)),
             cell_collector,
             tx_dep_provider,
             cell_dep_resolver,
@@ -421,6 +432,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             axon_submit_tx_cell_deps: OnceCell::new(),
             axon_issue_asset_tx_cell_deps: OnceCell::new(),
             axon_cross_chain_tx_cell_deps: OnceCell::new(),
+            axon_update_stake_tx_cell_deps: OnceCell::new(),
             network_type,
             cheque_timeout,
             cellbase_maturity,

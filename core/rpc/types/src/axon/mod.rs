@@ -178,6 +178,14 @@ pub struct SubmitCheckpointPayload {
     pub checkpoint_type_hash: H256,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct UpdateStakePayload {
+    pub fee_payer: Identity,
+    pub stake_type_id_args: Bytes,
+    pub new_quorum_size: Option<u8>,
+    pub new_stake_infos: Option<Vec<StakeInfo>>,
+}
+
 pub fn to_packed_array<const LEN: usize>(input: &[u8]) -> [packed::Byte; LEN] {
     assert_eq!(input.len(), LEN);
     let mut list = [packed::Byte::new(0); LEN];

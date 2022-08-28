@@ -5,18 +5,22 @@ use crate::{error::CoreError, InnerResult};
 use ckb_types::prelude::*;
 use ckb_types::{bytes::Bytes, packed};
 
+use ckb_sdk::rpc::ckb_indexer::{Cell, Order, ScriptType, SearchKey};
 use ckb_sdk::tx_builder::{balance_tx_capacity, CapacityBalancer, CapacityProvider};
 use ckb_types::core::{Capacity, FeeRate, TransactionView};
 use common::utils::{decode_udt_amount, parse_address, to_fixed_array};
+use common::TYPE_ID_CODE_HASH;
 use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, unpack_byte16, CrossChainTransferPayload, InitChainPayload, IssueAssetPayload,
-    SubmitCheckpointPayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK,
-    AXON_WITHDRAW_LOCK,
+    SubmitCheckpointPayload, UpdateStakePayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK,
+    AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
 };
 use core_rpc_types::consts::{BYTE_SHANNONS, DEFAULT_FEE_RATE, OMNI_SCRIPT};
 use core_rpc_types::TransactionCompletionResponse;
+
+use ckb_jsonrpc_types::{Script, ScriptHashType};
 
 use std::collections::{HashMap, HashSet};
 
@@ -573,6 +577,109 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             tx_view.into(),
             script_groups,
         ))
+    }
+
+    pub(crate) async fn prebuild_update_stake_tx(
+        &self,
+        ctx: Context,
+        payload: UpdateStakePayload,
+    ) -> InnerResult<TransactionCompletionResponse> {
+        let input_stake_cell = self
+            .get_one_cell_by_type_id_args(payload.stake_type_id_args)?
+            .ok_or(CoreError::CannotFindCell(AXON_STAKE_LOCK.to_string()))?;
+
+        let output_stake_cell = input_stake_cell.clone();
+        let output_stake_cell_data_builder =
+            generated::StakeLockCellData::from_slice(output_stake_cell.output_data.as_bytes())
+                .map_err(|e| CoreError::DecodeHexError(e.to_string()))?
+                .as_builder();
+
+        let output_stake_cell_data_builder = match payload.new_quorum_size {
+            Some(new_quorum_size) => {
+                output_stake_cell_data_builder.quorum_size(new_quorum_size.into())
+            }
+            None => output_stake_cell_data_builder,
+        };
+
+        let output_stake_cell_data_builder = match payload.new_stake_infos {
+            Some(new_stake_infos) => {
+                let stake_infos = new_stake_infos
+                    .iter()
+                    .map(|info| info.clone().try_into())
+                    .collect::<Result<Vec<generated::StakeInfo>, _>>()
+                    .map_err(|e| CoreError::DecodeHexError(e))?;
+                output_stake_cell_data_builder.stake_infos(
+                    generated::StakeInfoVecBuilder::default()
+                        .extend(stake_infos.into_iter())
+                        .build(),
+                )
+            }
+            None => output_stake_cell_data_builder,
+        };
+
+        let output_stake_cell_data = output_stake_cell_data_builder.build().as_bytes();
+
+        let cell_deps = self
+            .axon_update_stake_tx_cell_deps
+            .get_or_init(|| {
+                self.build_cell_deps(&[AXON_STAKE_LOCK, SECP256K1])
+                    .expect("Failed to init axon update stake tx cell deps")
+            })
+            .clone();
+
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(vec![packed::CellInputBuilder::default()
+                .previous_output(input_stake_cell.out_point.into())
+                .build()])
+            .set_outputs(vec![output_stake_cell.output.into()])
+            .set_outputs_data(vec![output_stake_cell_data.pack()])
+            .set_cell_deps(cell_deps)
+            .build();
+
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                payload.fee_payer.try_into().unwrap(),
+            )
+            .await?;
+
+        let script_grpups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_grpups,
+        ))
+    }
+
+    fn get_one_cell_by_type_id_args(&self, type_id_args: Bytes) -> InnerResult<Option<Cell>> {
+        self.get_one_cell(SearchKey {
+            script: Script {
+                code_hash: TYPE_ID_CODE_HASH,
+                hash_type: ScriptHashType::Type,
+                args: type_id_args.pack().into(),
+            },
+            script_type: ScriptType::Type,
+            filter: None,
+        })
+    }
+
+    fn get_one_cell(&self, search_key: SearchKey) -> InnerResult<Option<Cell>> {
+        let cells = tokio::task::block_in_place(|| {
+            self.ckb_indexer_client.lock().unwrap().get_cells(
+                search_key,
+                Order::Asc,
+                1.into(),
+                None,
+            )
+        })
+        .map_err(|e| CoreError::CommonError(e.to_string()))?;
+
+        if cells.objects.len() < 1 {
+            return Ok(None);
+        }
+
+        Ok(Some(cells.objects[0].clone()))
     }
 
     async fn balance_tx_capacity_by_identity(
