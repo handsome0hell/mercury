@@ -5,10 +5,10 @@ use crate::{error::CoreError, InnerResult};
 use ckb_types::prelude::*;
 use ckb_types::{
     bytes::{BufMut, Bytes, BytesMut},
-    packed,
+    core, packed,
 };
 
-use ckb_sdk::rpc::ckb_indexer::{Cell, Order, ScriptType, SearchKey};
+use ckb_sdk::rpc::ckb_indexer::{Cell, Order, ScriptType, SearchKey, SearchKeyFilter};
 use ckb_sdk::tx_builder::{balance_tx_capacity, CapacityBalancer, CapacityProvider};
 use ckb_sdk::types::Address;
 use ckb_types::core::{Capacity, FeeRate, TransactionView};
@@ -18,8 +18,9 @@ use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, unpack_byte16, BurnWithdrawalPayload, CrossChainTransferPayload, Identity,
-    InitChainPayload, IssueAssetPayload, SubmitCheckpointPayload, UpdateStakePayload,
-    AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
+    InitChainPayload, IssueAssetPayload, SubmitCheckpointPayload, UnlockWithdrawalPayload,
+    UpdateStakePayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK,
+    AXON_WITHDRAW_LOCK,
 };
 use core_rpc_types::consts::{BYTE_SHANNONS, DEFAULT_FEE_RATE, OMNI_SCRIPT};
 use core_rpc_types::TransactionCompletionResponse;
@@ -30,9 +31,11 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 struct ChainInfo {
+    checkpoint_cell: Cell,
     admin_identity: Identity,
     checkpoint_type_hash: Bytes,
     stake_type_hash: Bytes,
+    period: u64,
 }
 
 impl<C: CkbRpc> MercuryRpcImpl<C> {
@@ -674,6 +677,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             admin_identity,
             checkpoint_type_hash,
             stake_type_hash,
+            ..
         } = self.get_chain_info_by_checkpoint_type_id_args(payload.checkpoint_type_id_args)?;
 
         let mut withdrawal_lock_args = BytesMut::new();
@@ -734,17 +738,134 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .set_cell_deps(cell_deps)
             .build();
 
-        let change_script = Address::from_str(&payload.change_address)
-            .map_err(|err| CoreError::ParseAddressError(err))?
-            .payload()
-            .into();
         let tx_view = self
             .balance_tx_capacity_by_identity(
                 ctx.clone(),
                 &tx_view,
                 FeeRate(DEFAULT_FEE_RATE),
                 None,
-                Some(change_script),
+                Some(payload.change_address),
+            )
+            .await?;
+
+        let script_grpups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_grpups,
+        ))
+    }
+
+    pub(crate) async fn prebuild_unlock_withdrawal_tx(
+        &self,
+        ctx: Context,
+        payload: UnlockWithdrawalPayload,
+    ) -> InnerResult<TransactionCompletionResponse> {
+        let ChainInfo {
+            admin_identity,
+            checkpoint_type_hash,
+            period,
+            checkpoint_cell,
+            ..
+        } = self.get_chain_info_by_checkpoint_type_id_args(payload.checkpoint_type_id_args)?;
+
+        let mut withdrawal_lock_args = BytesMut::new();
+        withdrawal_lock_args.put_slice(&admin_identity.as_bytes());
+        withdrawal_lock_args.put(checkpoint_type_hash);
+        withdrawal_lock_args.put_slice(&payload.node_identity.as_bytes());
+        // TODO: Load only once
+        let withdrawal_lock = self
+            .builtin_scripts
+            .get(AXON_WITHDRAW_LOCK)
+            .cloned()
+            .expect("get withdrawal lock")
+            .script
+            .as_builder()
+            .args(Bytes::from(withdrawal_lock_args).pack())
+            .build();
+
+        let all_withdrawal_cells = self.get_all_cells(SearchKey {
+            script: withdrawal_lock.into(),
+            script_type: ScriptType::Lock,
+            filter: None,
+        })?;
+        let withdrawal_cells = all_withdrawal_cells
+            .into_iter()
+            .filter(|cell| {
+                let cell_period =
+                    u64::from_le_bytes(cell.output_data.as_bytes()[128..192].try_into().unwrap());
+
+                cell_period < period
+            })
+            .collect::<Vec<Cell>>();
+
+        if withdrawal_cells.len() < 1 {
+            return Err(CoreError::CommonError("withdrawal cell not found".to_string()).into());
+        }
+
+        let receiver_args = Address::from_str(&payload.receiver)
+            .map_err(|err| CoreError::ParseAddressError(err))?
+            .payload()
+            .args();
+        let acp_lock = self
+            .builtin_scripts
+            .get(ACP)
+            .cloned()
+            .expect("get acp lock")
+            .script
+            .as_builder()
+            .args(receiver_args.pack())
+            .build();
+        let mut filter = SearchKeyFilter::default();
+        filter.script = withdrawal_cells[0].output.type_.clone();
+        let input_acp_cell = self
+            .get_one_cell(SearchKey {
+                script: acp_lock.into(),
+                script_type: ScriptType::Lock,
+                filter: Some(filter),
+            })?
+            .ok_or(CoreError::CannotFindCell(ACP.to_string()))?;
+
+        let output_amount = decode_udt_amount(input_acp_cell.output_data.as_bytes())
+            .unwrap()
+            .checked_add(withdrawal_cells.iter().fold(0, |a, cell| {
+                a.checked_add(decode_udt_amount(cell.output_data.as_bytes()).unwrap())
+                    .unwrap()
+            }))
+            .unwrap();
+
+        // TODO: Load only once
+        let mut cell_deps = self
+            .build_cell_deps(&[SUDT, ACP, SECP256K1, AXON_WITHDRAW_LOCK])
+            .expect("Failed to init axon burn withdrawal tx cell deps");
+        cell_deps.push(
+            packed::CellDepBuilder::default()
+                .out_point(checkpoint_cell.out_point.into())
+                .dep_type(packed::Byte::new(core::DepType::Code.into()))
+                .build(),
+        );
+
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(
+                withdrawal_cells
+                    .iter()
+                    .map(cell_to_cell_input)
+                    .chain([cell_to_cell_input(&input_acp_cell)])
+                    .collect(),
+            )
+            .set_outputs(vec![input_acp_cell.output.into()])
+            .set_outputs_data(vec![
+                Bytes::copy_from_slice(&output_amount.to_le_bytes()).pack()
+            ])
+            .set_cell_deps(cell_deps)
+            .build();
+
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                None,
+                Some(payload.change_address),
             )
             .await?;
 
@@ -770,21 +891,28 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         let checkpoint_cell_data =
             generated::CheckpointLockCellData::from_slice(checkpoint_cell.output_data.as_bytes())
                 .map_err(|e| CoreError::DecodeHexError(e.to_string()))?;
+        let checkpoint_cell_data_reader = checkpoint_cell_data.as_reader();
 
-        let stake_type_hash = Bytes::copy_from_slice(
-            checkpoint_cell_data
-                .as_reader()
-                .stake_type_hash()
-                .as_slice(),
-        );
+        let stake_type_hash =
+            Bytes::copy_from_slice(checkpoint_cell_data_reader.stake_type_hash().as_slice());
         let checkpoint_type_hash =
             Bytes::copy_from_slice(checkpoint_lock_args_reader.type_id_hash().as_slice());
         let admin_identity = checkpoint_lock_args_reader.admin_identity().into();
 
+        let period = u64::from_le_bytes(
+            checkpoint_cell_data_reader
+                .period()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        );
+
         Ok(ChainInfo {
+            checkpoint_cell,
             admin_identity,
             stake_type_hash,
             checkpoint_type_hash,
+            period,
         })
     }
 
@@ -838,7 +966,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         tx_view: &TransactionView,
         fee_rate: FeeRate,
         identity: Option<core_rpc_types::Identity>,
-        change_lock_script: Option<packed::Script>,
+        change_address: Option<String>,
     ) -> InnerResult<TransactionView> {
         let scripts = match identity {
             Some(identity) => self
@@ -848,6 +976,16 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 .map(|script| (script.clone(), packed::WitnessArgs::default()))
                 .collect(),
             None => vec![],
+        };
+
+        let change_lock_script = match change_address {
+            Some(address) => Some(
+                Address::from_str(&address)
+                    .map_err(|err| CoreError::ParseAddressError(err))?
+                    .payload()
+                    .into(),
+            ),
+            None => None,
         };
 
         Ok(tokio::task::block_in_place(|| {

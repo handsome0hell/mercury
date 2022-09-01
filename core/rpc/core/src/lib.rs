@@ -12,7 +12,7 @@ use ckb_types::{H160, H256};
 use common::{Order, Result};
 use core_rpc_types::axon::{
     BurnWithdrawalPayload, CrossChainTransferPayload, InitChainPayload, InitChainResponse,
-    IssueAssetPayload, SubmitCheckpointPayload, UpdateStakePayload,
+    IssueAssetPayload, SubmitCheckpointPayload, UnlockWithdrawalPayload, UpdateStakePayload,
 };
 use core_rpc_types::error::MercuryRpcError;
 use core_rpc_types::{
@@ -45,6 +45,12 @@ pub trait MercuryRpc {
         &self,
         payload: QueryTransactionsPayload,
     ) -> RpcResult<PaginationResponse<TxView>>;
+
+    #[method(name = "build_unlock_withdrawal_transaction")]
+    async fn build_unlock_withdrawal_transaction(
+        &self,
+        payload: UnlockWithdrawalPayload,
+    ) -> RpcResult<TransactionCompletionResponse>;
 
     #[method(name = "build_burn_withdrawal_transaction")]
     async fn build_burn_withdrawal_transaction(

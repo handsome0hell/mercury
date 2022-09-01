@@ -202,6 +202,14 @@ pub struct BurnWithdrawalPayload {
     pub node_identity: Identity,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct UnlockWithdrawalPayload {
+    pub change_address: String,
+    pub checkpoint_type_id_args: Bytes,
+    pub node_identity: Identity,
+    pub receiver: String,
+}
+
 pub fn to_packed_array<const LEN: usize>(input: &[u8]) -> [packed::Byte; LEN] {
     assert_eq!(input.len(), LEN);
     let mut list = [packed::Byte::new(0); LEN];
