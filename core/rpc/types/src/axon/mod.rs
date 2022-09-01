@@ -63,6 +63,15 @@ impl TryFrom<Identity> for generated::Identity {
     }
 }
 
+impl<'r> Into<Identity> for generated::IdentityReader<'r> {
+    fn into(self) -> Identity {
+        let flag = u8::from_le(self.flag().as_slice()[0]);
+        let content = Bytes::copy_from_slice(self.content().as_slice());
+
+        Identity { flag, content }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct OmniConfig {
     pub version: u8,
@@ -184,6 +193,13 @@ pub struct UpdateStakePayload {
     pub stake_type_id_args: Bytes,
     pub new_quorum_size: Option<u8>,
     pub new_stake_infos: Option<Vec<StakeInfo>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct BurnWithdrawalPayload {
+    pub change_address: String,
+    pub checkpoint_type_id_args: Bytes,
+    pub node_identity: Identity,
 }
 
 pub fn to_packed_array<const LEN: usize>(input: &[u8]) -> [packed::Byte; LEN] {
