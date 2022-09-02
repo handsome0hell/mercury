@@ -5,6 +5,7 @@ use common::utils::to_fixed_array;
 use serde::{Deserialize, Serialize};
 
 use crate::TransactionCompletionResponse;
+pub use molecule::error::VerificationError;
 
 pub const AXON_CHECKPOINT_LOCK: &str = "axon_checkpoint";
 pub const AXON_SELECTION_LOCK: &str = "axon_selection";
@@ -208,6 +209,18 @@ pub struct UnlockWithdrawalPayload {
     pub checkpoint_type_id_args: Bytes,
     pub node_identity: Identity,
     pub receiver: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct UpdateCheckpointPayload {
+    pub fee_payer: Identity,
+    pub checkpoint_type_id_args: Bytes,
+    pub new_state: Option<u8>,
+    pub new_period: Option<u64>,
+    pub new_era: Option<u64>,
+    pub new_block_hash: Option<H256>,
+    pub new_unlock_period: Option<u32>,
+    pub new_common_ref: Option<Bytes>,
 }
 
 pub fn to_packed_array<const LEN: usize>(input: &[u8]) -> [packed::Byte; LEN] {

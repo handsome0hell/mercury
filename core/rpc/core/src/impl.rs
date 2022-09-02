@@ -8,7 +8,8 @@ pub(crate) mod utils_types;
 
 use core_rpc_types::axon::{
     BurnWithdrawalPayload, CrossChainTransferPayload, InitChainPayload, InitChainResponse,
-    IssueAssetPayload, SubmitCheckpointPayload, UnlockWithdrawalPayload, UpdateStakePayload,
+    IssueAssetPayload, SubmitCheckpointPayload, UnlockWithdrawalPayload, UpdateCheckpointPayload,
+    UpdateStakePayload,
 };
 
 use crate::r#impl::build_tx::calculate_tx_size;
@@ -135,6 +136,13 @@ impl<C: CkbRpc> MercuryRpcServer for MercuryRpcImpl<C> {
         payload: TransferPayload,
     ) -> RpcResult<TransactionCompletionResponse> {
         rpc_impl!(self, inner_build_transfer_transaction, payload)
+    }
+
+    async fn build_update_checkpoint_transaction(
+        &self,
+        payload: UpdateCheckpointPayload,
+    ) -> RpcResult<TransactionCompletionResponse> {
+        rpc_impl!(self, inner_update_checkpoint, payload)
     }
 
     async fn build_unlock_withdrawal_transaction(

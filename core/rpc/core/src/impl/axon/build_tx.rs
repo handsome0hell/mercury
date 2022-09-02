@@ -19,8 +19,8 @@ use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, unpack_byte16, BurnWithdrawalPayload, CrossChainTransferPayload, Identity,
     InitChainPayload, IssueAssetPayload, SubmitCheckpointPayload, UnlockWithdrawalPayload,
-    UpdateStakePayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK,
-    AXON_WITHDRAW_LOCK,
+    UpdateCheckpointPayload, UpdateStakePayload, VerificationError, AXON_CHECKPOINT_LOCK,
+    AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
 };
 use core_rpc_types::consts::{BYTE_SHANNONS, DEFAULT_FEE_RATE, OMNI_SCRIPT};
 use core_rpc_types::TransactionCompletionResponse;
@@ -866,6 +866,85 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 FeeRate(DEFAULT_FEE_RATE),
                 None,
                 Some(payload.change_address),
+            )
+            .await?;
+
+        let script_grpups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_grpups,
+        ))
+    }
+
+    pub(crate) async fn prebuild_update_checkpoint_tx(
+        &self,
+        ctx: Context,
+        payload: UpdateCheckpointPayload,
+    ) -> InnerResult<TransactionCompletionResponse> {
+        let input_checkpoint_cell = self
+            .get_one_cell_by_type_id_args(payload.checkpoint_type_id_args)?
+            .ok_or(CoreError::CannotFindCell(AXON_CHECKPOINT_LOCK.to_string()))?;
+
+        let output_checkpoint_cell_data = (|| {
+            let output_checkpoint_cell_data_builder =
+                generated::CheckpointLockCellData::from_slice(
+                    input_checkpoint_cell.output_data.as_bytes(),
+                )?
+                .as_builder();
+
+            let output_checkpoint_cell_data_builder = match payload.new_state {
+                Some(state) => output_checkpoint_cell_data_builder.state(state.into()),
+                None => output_checkpoint_cell_data_builder,
+            };
+            let output_checkpoint_cell_data_builder = match payload.new_period {
+                Some(period) => output_checkpoint_cell_data_builder
+                    .period(generated::Byte8::from_slice(&period.to_le_bytes())?),
+                None => output_checkpoint_cell_data_builder,
+            };
+            let output_checkpoint_cell_data_builder = match payload.new_era {
+                Some(era) => output_checkpoint_cell_data_builder
+                    .era(generated::Byte8::from_slice(&era.to_le_bytes())?),
+                None => output_checkpoint_cell_data_builder,
+            };
+            let output_checkpoint_cell_data_builder = match payload.new_block_hash {
+                Some(block_hash) => output_checkpoint_cell_data_builder
+                    .block_hash(generated::Byte32::from_slice(block_hash.as_bytes())?),
+                None => output_checkpoint_cell_data_builder,
+            };
+            let output_checkpoint_cell_data_builder = match payload.new_unlock_period {
+                Some(unlock_period) => output_checkpoint_cell_data_builder
+                    .unlock_period(generated::Byte4::from_slice(&unlock_period.to_le_bytes())?),
+                None => output_checkpoint_cell_data_builder,
+            };
+            let output_checkpoint_cell_data_builder = match payload.new_common_ref {
+                Some(common_ref) => output_checkpoint_cell_data_builder
+                    .common_ref(generated::Byte10::from_slice(&common_ref)?),
+                None => output_checkpoint_cell_data_builder,
+            };
+
+            Ok(output_checkpoint_cell_data_builder.build().as_bytes())
+        })()
+        .map_err(|e: VerificationError| CoreError::DecodeHexError(e.to_string()))?;
+
+        // TODO: Load only once
+        let cell_deps = self
+            .build_cell_deps(&[AXON_CHECKPOINT_LOCK, SECP256K1])
+            .expect("Failed to init axon update checkpoint tx cell deps");
+
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(vec![cell_to_cell_input(&input_checkpoint_cell)])
+            .set_outputs(vec![input_checkpoint_cell.output.into()])
+            .set_outputs_data(vec![output_checkpoint_cell_data.pack()])
+            .set_cell_deps(cell_deps)
+            .build();
+
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                Some(payload.fee_payer.try_into().unwrap()),
+                None,
             )
             .await?;
 
