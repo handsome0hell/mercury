@@ -2,6 +2,7 @@ use crate::r#impl::build_tx::build_witnesses;
 use crate::r#impl::MercuryRpcImpl;
 use crate::{error::CoreError, InnerResult};
 
+use ckb_sdk::traits::{CellCollector, CellQueryOptions, LiveCell};
 use ckb_types::prelude::*;
 use ckb_types::{
     bytes::{BufMut, Bytes, BytesMut},
@@ -18,9 +19,9 @@ use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, unpack_byte16, BurnWithdrawalPayload, CrossChainTransferPayload, Identity,
-    InitChainPayload, IssueAssetPayload, SubmitCheckpointPayload, UnlockWithdrawalPayload,
-    UpdateCheckpointPayload, UpdateStakePayload, VerificationError, AXON_CHECKPOINT_LOCK,
-    AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
+    InitChainPayload, IssueAssetPayload, StakeTokenPayload, SubmitCheckpointPayload,
+    UnlockWithdrawalPayload, UpdateCheckpointPayload, UpdateStakePayload, VerificationError,
+    AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
 };
 use core_rpc_types::consts::{BYTE_SHANNONS, DEFAULT_FEE_RATE, OMNI_SCRIPT};
 use core_rpc_types::TransactionCompletionResponse;
@@ -955,6 +956,149 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ))
     }
 
+    pub(crate) async fn prebuild_stake_token_tx(
+        &self,
+        ctx: Context,
+        payload: StakeTokenPayload,
+    ) -> InnerResult<TransactionCompletionResponse> {
+        let ChainInfo {
+            admin_identity,
+            checkpoint_cell,
+            stake_type_hash,
+            ..
+        } = self.get_chain_info_by_checkpoint_type_id_args(payload.checkpoint_type_id_args)?;
+
+        let input_stake_cell = self
+            .get_one_cell_by_type_id_args(payload.stake_type_id_args)?
+            .ok_or(CoreError::CannotFindCell(AXON_STAKE_LOCK.to_string()))?;
+
+        let output_stake_cell = input_stake_cell.clone();
+        let output_stake_cell_data_builder =
+            generated::StakeLockCellData::from_slice(output_stake_cell.output_data.as_bytes())
+                .map_err(|e| CoreError::DecodeHexError(e.to_string()))?
+                .as_builder();
+
+        // TODO: modify stake infos
+
+        let output_stake_cell_data = output_stake_cell_data_builder.build().as_bytes();
+
+        // TODO: Load only once
+        let token_type = self
+            .builtin_scripts
+            .get(SUDT)
+            .cloned()
+            .expect("get sudt type")
+            .script
+            .as_builder()
+            .args(payload.token_type_args.pack())
+            .build();
+
+        let mut stake_lock_args = BytesMut::new();
+        stake_lock_args.put_slice(&admin_identity.as_bytes());
+        stake_lock_args.put(stake_type_hash);
+        stake_lock_args.put_slice(&payload.node_identity.as_bytes());
+        // TODO: Load only once
+        let stake_lock = self
+            .builtin_scripts
+            .get(AXON_STAKE_LOCK)
+            .cloned()
+            .expect("get stake lock")
+            .script
+            .as_builder()
+            .args(stake_lock_args.pack())
+            .build();
+        let mut filter = SearchKeyFilter::default();
+        filter.script = Some(token_type.clone().into());
+        let all_stake_token_cells = self.get_all_cells(SearchKey {
+            script: stake_lock.into(),
+            script_type: ScriptType::Lock,
+            filter: Some(filter),
+        })?;
+
+        let (token_cells, excessed_amount) = self
+            .get_udt_cells_by_identity(
+                ctx.clone(),
+                payload.node_identity.clone().try_into().unwrap(),
+                payload.amount.parse().unwrap(),
+                token_type.clone(),
+            )
+            .await?;
+
+        let output_acp_data = Bytes::copy_from_slice(&excessed_amount.to_le_bytes());
+        let output_acp_cell = packed::CellOutputBuilder::default()
+            .type_(Some(token_type).pack())
+            .lock(
+                self.build_acp_cell(
+                    hex::decode(&payload.node_identity.content.to_vec()[2..])
+                        .unwrap()
+                        .into(),
+                ),
+            )
+            .build_exact_capacity(Capacity::shannons(
+                (output_acp_data.len() + 10) as u64 * BYTE_SHANNONS,
+            ))
+            .unwrap();
+
+        let mut cell_deps = self
+            .build_cell_deps(&[SUDT, AXON_STAKE_LOCK, SECP256K1])
+            .expect("Failed to init axon stake token tx cell deps");
+        cell_deps.push(
+            packed::CellDepBuilder::default()
+                .out_point(checkpoint_cell.out_point.into())
+                .dep_type(packed::Byte::new(core::DepType::Code.into()))
+                .build(),
+        );
+
+        let tx_view = TransactionView::new_advanced_builder()
+            .set_inputs(
+                [cell_to_cell_input(&input_stake_cell)]
+                    .into_iter()
+                    .chain(token_cells.iter().map(live_cell_to_cell_input))
+                    .chain(all_stake_token_cells.iter().map(cell_to_cell_input))
+                    .collect(),
+            )
+            .set_outputs(
+                [output_stake_cell.output.into()]
+                    .into_iter()
+                    .chain([output_acp_cell].into_iter())
+                    .chain(
+                        all_stake_token_cells
+                            .iter()
+                            .map(|c| c.output.clone().into()),
+                    )
+                    .collect(),
+            )
+            .set_outputs_data(
+                [output_stake_cell_data.pack()]
+                    .into_iter()
+                    .chain([output_acp_data.pack()].into_iter())
+                    .chain(
+                        all_stake_token_cells
+                            .iter()
+                            .map(|c| c.output_data.clone().into_bytes().pack()),
+                    )
+                    .collect(),
+            )
+            .set_cell_deps(cell_deps)
+            .build();
+
+        let tx_view = self
+            .balance_tx_capacity_by_identity(
+                ctx.clone(),
+                &tx_view,
+                FeeRate(DEFAULT_FEE_RATE),
+                Some(payload.fee_payer.try_into().unwrap()),
+                None,
+            )
+            .await?;
+
+        let script_grpups = self.get_tx_script_groups(&tx_view)?;
+        Ok(TransactionCompletionResponse::new(
+            tx_view.into(),
+            script_grpups,
+        ))
+    }
+
     fn get_chain_info_by_checkpoint_type_id_args(
         &self,
         checkpoint_type_id_args: Bytes,
@@ -1084,9 +1228,68 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .map_err(CoreError::from)
         })?)
     }
+
+    async fn get_udt_cells_by_identity(
+        &self,
+        ctx: Context,
+        identity: core_rpc_types::Identity,
+        needed_amount: u128,
+        type_: packed::Script,
+    ) -> InnerResult<(Vec<LiveCell>, u128)> {
+        let mut result_cells = Vec::new();
+        let mut result_amount = 0;
+
+        let scripts = self
+            .get_scripts_by_identity(ctx.clone(), identity, None)
+            .await?;
+
+        let token_query_option = CellQueryOptions::new_type(type_);
+        for script in scripts {
+            let mut query_option = token_query_option.clone();
+            query_option.secondary_script = Some(script);
+
+            while needed_amount > result_amount {
+                let (cells, _) = tokio::task::block_in_place(|| {
+                    self.cell_collector
+                        .lock()
+                        .unwrap()
+                        .collect_live_cells(&query_option, true)
+                })
+                .map_err(|e| CoreError::CommonError(e.to_string()))?;
+
+                if cells.len() == 0 {
+                    break;
+                }
+
+                let cell = cells[0].clone();
+                let amount = decode_udt_amount(&cell.output_data).unwrap();
+                result_amount = result_amount.checked_add(amount).unwrap();
+                result_cells.push(cell);
+            }
+        }
+
+        if needed_amount > result_amount {
+            return Err(CoreError::UDTIsNotEnough(format!(
+                "shortage: {}",
+                needed_amount - result_amount,
+            ))
+            .into());
+        }
+
+        Ok((
+            result_cells,
+            result_amount.checked_sub(needed_amount).unwrap(),
+        ))
+    }
 }
 
 fn cell_to_cell_input(cell: &Cell) -> packed::CellInput {
+    packed::CellInputBuilder::default()
+        .previous_output(cell.out_point.clone().into())
+        .build()
+}
+
+fn live_cell_to_cell_input(cell: &LiveCell) -> packed::CellInput {
     packed::CellInputBuilder::default()
         .previous_output(cell.out_point.clone().into())
         .build()

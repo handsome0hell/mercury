@@ -13,9 +13,9 @@ use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::{
     generated, pack_u128, pack_u32, pack_u64, to_packed_array, BurnWithdrawalPayload,
     CheckpointConfig, Identity, InitChainPayload, InitChainResponse, IssueAssetPayload, OmniConfig,
-    SidechainConfig, StakeConfig, SubmitCheckpointPayload, UnlockWithdrawalPayload,
-    UpdateCheckpointPayload, UpdateStakePayload, AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK,
-    AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
+    SidechainConfig, StakeConfig, StakeTokenPayload, SubmitCheckpointPayload,
+    UnlockWithdrawalPayload, UpdateCheckpointPayload, UpdateStakePayload, AXON_CHECKPOINT_LOCK,
+    AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
 };
 use core_rpc_types::consts::{BYTE_SHANNONS, OMNI_SCRIPT, TYPE_ID_SCRIPT};
 use core_rpc_types::TransactionCompletionResponse;
@@ -115,6 +115,14 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         payload: UpdateCheckpointPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
         self.prebuild_update_checkpoint_tx(ctx, payload).await
+    }
+
+    pub(crate) async fn inner_stake_token(
+        &self,
+        ctx: Context,
+        payload: StakeTokenPayload,
+    ) -> InnerResult<TransactionCompletionResponse> {
+        self.prebuild_stake_token_tx(ctx, payload).await
     }
 
     pub(crate) fn build_stake_cell(

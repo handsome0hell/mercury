@@ -223,6 +223,16 @@ pub struct UpdateCheckpointPayload {
     pub new_common_ref: Option<Bytes>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct StakeTokenPayload {
+    pub fee_payer: Identity,
+    pub node_identity: Identity,
+    pub checkpoint_type_id_args: Bytes,
+    pub stake_type_id_args: Bytes,
+    pub token_type_args: Bytes,
+    pub amount: String,
+}
+
 pub fn to_packed_array<const LEN: usize>(input: &[u8]) -> [packed::Byte; LEN] {
     assert_eq!(input.len(), LEN);
     let mut list = [packed::Byte::new(0); LEN];
