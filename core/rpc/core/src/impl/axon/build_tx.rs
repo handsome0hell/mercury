@@ -17,10 +17,10 @@ use common::utils::{decode_udt_amount, parse_address, to_fixed_array};
 use common::TYPE_ID_CODE_HASH;
 use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
-use core_rpc_types::axon::generated::{Byte8Reader, StakeInfoVecBuilder};
+use core_rpc_types::axon::generated::{Byte16Reader, Byte8Reader, StakeInfoVecBuilder};
 use core_rpc_types::axon::{
-    generated, unpack_byte16, BurnWithdrawalPayload, CrossChainTransferPayload, Identity,
-    InitChainPayload, IssueAssetPayload, StakeInfo, StakeTokenPayload, SubmitCheckpointPayload,
+    generated, BurnWithdrawalPayload, CrossChainTransferPayload, Identity, InitChainPayload,
+    IssueAssetPayload, StakeInfo, StakeTokenPayload, SubmitCheckpointPayload,
     UnlockWithdrawalPayload, UpdateCheckpointPayload, UpdateStakePayload, VerificationError,
     AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
 };
@@ -40,6 +40,7 @@ struct ChainInfo {
     stake_type_hash: Bytes,
     period: u64,
     era: u64,
+    base_reward: u128,
 }
 
 impl<C: CkbRpc> MercuryRpcImpl<C> {
@@ -48,68 +49,46 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ctx: Context,
         payload: SubmitCheckpointPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
+        let selection_lock = self
+            .builtin_scripts
+            .get(AXON_SELECTION_LOCK)
+            .cloned()
+            .expect("get selection lock")
+            .script
+            .as_builder()
+            .args(payload.selection_lock_args.pack())
+            .build();
         let input_selection_cell = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![payload.selection_lock_hash.clone()],
-                vec![],
-                None,
-                None,
-                PaginationRequest::default().limit(Some(1)),
-            )
-            .await?
-            .response
-            .first()
-            .cloned()
-            .ok_or_else(|| CoreError::CannotFindCell(AXON_SELECTION_LOCK.to_string()))?;
+            .get_one_cell(SearchKey {
+                script: selection_lock.into(),
+                script_type: ScriptType::Lock,
+                filter: None,
+            })?
+            .ok_or(CoreError::CannotFindCell(AXON_SELECTION_LOCK.to_string()))?;
 
-        let input_checkpoint_cell = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![],
-                vec![payload.checkpoint_type_hash.clone()],
-                None,
-                None,
-                PaginationRequest::default().limit(Some(1)),
-            )
-            .await?
-            .response
-            .first()
-            .cloned()
-            .ok_or_else(|| CoreError::CannotFindCell(AXON_SELECTION_LOCK.to_string()))?;
-        let base_reward = unpack_byte16(
-            generated::CheckpointLockCellData::new_unchecked(
-                input_checkpoint_cell.cell_data.clone(),
-            )
-            .base_reward(),
-        );
-        let sudt_args = input_selection_cell.cell_output.lock().calc_script_hash();
+        let ChainInfo {
+            admin_identity,
+            checkpoint_type_hash,
+            checkpoint_cell: input_checkpoint_cell,
+            base_reward,
+            ..
+        } = self.get_chain_info_by_checkpoint_type_id_args(payload.checkpoint_type_id_args)?;
+
+        let sudt_args =
+            packed::Script::from(input_selection_cell.output.lock.clone()).calc_script_hash();
         let withdraw_cell = self.build_withdraw_cell(
             sudt_args.unpack(),
-            payload.admin_id.clone(),
-            payload.checkpoint_type_hash.pack(),
-            payload.node_id.clone(),
+            admin_identity.clone(),
+            packed::Byte32::from_slice(&checkpoint_type_hash)
+                .map_err(|e| CoreError::DecodeHexError(e.to_string()))?,
+            payload.node_identity.clone(),
         );
 
-        let withdraw_cells = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![withdraw_cell.lock().calc_script_hash().unpack()],
-                vec![withdraw_cell
-                    .type_()
-                    .to_opt()
-                    .unwrap()
-                    .calc_script_hash()
-                    .unpack()],
-                None,
-                None,
-                Default::default(),
-            )
-            .await?
-            .response;
+        let withdraw_cells = self.get_all_cells(SearchKey {
+            script: withdraw_cell.lock().into(),
+            script_type: ScriptType::Lock,
+            filter: None,
+        })?;
 
         let input_withdraw_cell = if withdraw_cells.len() < 2 {
             None
@@ -122,8 +101,8 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                         if res.is_eq() {
                             return res;
                         }
-                        let a: u32 = x.out_point.index().unpack();
-                        let b: u32 = y.out_point.index().unpack();
+                        let a: u32 = x.out_point.index.into();
+                        let b: u32 = y.out_point.index.into();
                         a.cmp(&b)
                     })
                     .cloned()
@@ -136,13 +115,13 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
 
         let (output_withdraw_cell, output_withdraw_data) =
             if let Some(cell) = input_withdraw_cell.clone() {
-                let new_amount = decode_udt_amount(cell.cell_data.as_ref())
+                let new_amount = decode_udt_amount(cell.output_data.as_bytes())
                     .unwrap()
                     .checked_add(base_reward)
                     .unwrap();
                 let mut data = new_amount.to_le_bytes().to_vec();
                 data.extend_from_slice(&payload.period_number.to_le_bytes());
-                (cell.cell_output.clone(), Bytes::from(data))
+                (cell.output.clone().into(), Bytes::from(data))
             } else {
                 let mut data = base_reward.to_le_bytes().to_vec();
                 data.extend_from_slice(&payload.period_number.to_le_bytes());
@@ -171,15 +150,15 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         }
 
         let tx_view = TransactionView::new_advanced_builder()
-            .set_inputs(self.build_transfer_tx_cell_inputs(&inputs, None, HashMap::default())?)
+            .set_inputs(inputs.iter().map(cell_to_cell_input).collect())
             .set_outputs(vec![
-                output_selection_cell.cell_output,
-                output_checkpoint_cell.cell_output,
+                output_selection_cell.output.into(),
+                output_checkpoint_cell.output.into(),
                 output_withdraw_cell,
             ])
             .set_outputs_data(vec![
-                output_selection_cell.cell_data.pack(),
-                output_checkpoint_cell.cell_data.pack(),
+                output_selection_cell.output_data.into(),
+                output_checkpoint_cell.output_data.into(),
                 output_withdraw_data.pack(),
             ])
             .set_cell_deps(cell_deps)
@@ -190,7 +169,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 ctx.clone(),
                 &tx_view,
                 FeeRate(DEFAULT_FEE_RATE),
-                Some(payload.admin_id.try_into().unwrap()),
+                Some(admin_identity.try_into().unwrap()),
                 None,
             )
             .await?;
@@ -1199,8 +1178,8 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         let admin_identity = checkpoint_lock_args_reader.admin_identity().into();
 
         let period = from_byte8_reader(checkpoint_cell_data_reader.period()).unwrap();
-
         let era = from_byte8_reader(checkpoint_cell_data_reader.era()).unwrap();
+        let base_reward = from_byte16_reader(checkpoint_cell_data_reader.base_reward()).unwrap();
 
         Ok(ChainInfo {
             checkpoint_cell,
@@ -1209,6 +1188,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             checkpoint_type_hash,
             period,
             era,
+            base_reward,
         })
     }
 
@@ -1383,4 +1363,8 @@ fn unpack_output_data_vec(outputs_data: packed::BytesVec) -> Vec<packed::Bytes> 
 
 fn from_byte8_reader(reader: Byte8Reader) -> Result<u64, TryFromSliceError> {
     Ok(u64::from_le_bytes(reader.as_slice().try_into()?))
+}
+
+fn from_byte16_reader(reader: Byte16Reader) -> Result<u128, TryFromSliceError> {
+    Ok(u128::from_le_bytes(reader.as_slice().try_into()?))
 }

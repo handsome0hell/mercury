@@ -219,12 +219,11 @@ pub struct CrossChainTransferPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct SubmitCheckpointPayload {
-    pub node_id: Identity,
-    pub admin_id: Identity,
+    pub node_identity: Identity,
     pub period_number: u64,
     pub checkpoint: Bytes,
-    pub selection_lock_hash: H256,
-    pub checkpoint_type_hash: H256,
+    pub selection_lock_args: Bytes,
+    pub checkpoint_type_id_args: Bytes,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
