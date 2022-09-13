@@ -200,10 +200,10 @@ pub struct InitChainResponse {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct IssueAssetPayload {
-    pub admin_id: Identity,
-    pub selection_lock_hash: H256,
-    pub omni_type_hash: H256,
-    pub receipt_address: Bytes,
+    pub fee_payer: Identity,
+    pub selection_lock_args: Bytes,
+    pub omni_type_id_args: Bytes,
+    pub receipt: String,
     pub amount: String,
 }
 

@@ -15,7 +15,7 @@ use ckb_sdk::types::Address;
 use ckb_types::core::{Capacity, FeeRate, TransactionView};
 use common::utils::{decode_udt_amount, parse_address, to_fixed_array};
 use common::TYPE_ID_CODE_HASH;
-use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
+use common::{Context, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
 use core_rpc_types::axon::generated::{Byte16Reader, Byte8Reader, StakeInfoVecBuilder};
 use core_rpc_types::axon::{
@@ -295,64 +295,52 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         ctx: Context,
         payload: IssueAssetPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
+        let receipt = parse_address(&payload.receipt)
+            .map_err(|e| CoreError::ParseAddressError(e.to_string()))?;
+
         let input_omni_cell = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![],
-                vec![payload.omni_type_hash.clone()],
-                None,
-                None,
-                PaginationRequest::default().limit(Some(1)),
-            )
-            .await?
-            .response
-            .first()
-            .cloned()
-            .ok_or_else(|| CoreError::CannotFindCell(OMNI_SCRIPT.to_string()))?;
+            .get_one_cell_by_type_id_args(payload.omni_type_id_args)?
+            .ok_or(CoreError::CannotFindCell(OMNI_SCRIPT.to_string()))?;
         println!("input omni cell {:?}", input_omni_cell);
-        let input_selection_cell = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![payload.selection_lock_hash.clone()],
-                vec![],
-                None,
-                None,
-                PaginationRequest::default().limit(Some(1)),
-            )
-            .await?
-            .response
-            .first()
+        let selection_lock = self
+            .builtin_scripts
+            .get(AXON_SELECTION_LOCK)
             .cloned()
-            .ok_or_else(|| CoreError::CannotFindCell(AXON_SELECTION_LOCK.to_string()))?;
+            .expect("get selection lock")
+            .script
+            .as_builder()
+            .args(payload.selection_lock_args.pack())
+            .build();
+        let input_selection_cell = self
+            .get_one_cell(SearchKey {
+                script: selection_lock.into(),
+                script_type: ScriptType::Lock,
+                filter: None,
+            })?
+            .ok_or(CoreError::CannotFindCell(AXON_SELECTION_LOCK.to_string()))?;
         println!("input selection cell {:?}", input_selection_cell);
 
         let mint_amount: u128 = payload.amount.parse().unwrap();
-        let mut omni_data = input_omni_cell.cell_data.clone().to_vec();
+        let mut omni_data = input_omni_cell.output_data.as_bytes().to_vec();
         let new_supply = u128::from_le_bytes(to_fixed_array(&omni_data[1..17])) + mint_amount;
         omni_data[1..17].swap_with_slice(&mut new_supply.to_le_bytes());
 
         let acp_data = Bytes::from(mint_amount.to_le_bytes().to_vec());
-        let acp_cell =
-            packed::CellOutputBuilder::default()
-                .type_(
-                    Some(self.build_sudt_script(
-                        input_selection_cell.cell_output.lock().calc_script_hash(),
-                    ))
-                    .pack(),
-                )
-                .lock(
-                    self.build_acp_cell(
-                        hex::decode(&payload.admin_id.content.to_vec()[2..])
-                            .unwrap()
-                            .into(),
+        let acp_cell = packed::CellOutputBuilder::default()
+            .type_(
+                Some(
+                    self.build_sudt_script(
+                        packed::Script::from(input_selection_cell.output.lock.clone())
+                            .calc_script_hash(),
                     ),
                 )
-                .build_exact_capacity(Capacity::shannons(
-                    (acp_data.len() + 10) as u64 * BYTE_SHANNONS,
-                ))
-                .unwrap();
+                .pack(),
+            )
+            .lock(self.build_acp_cell(receipt.payload().args()).into())
+            .build_exact_capacity(Capacity::shannons(
+                (acp_data.len() + 10) as u64 * BYTE_SHANNONS,
+            ))
+            .unwrap();
 
         let cell_deps = self
             .axon_issue_asset_tx_cell_deps
@@ -363,14 +351,15 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .clone();
 
         let tx_view = TransactionView::new_advanced_builder()
-            .set_inputs(self.build_transfer_tx_cell_inputs(
-                &[input_selection_cell.clone(), input_omni_cell.clone()],
-                None,
-                HashMap::default(),
-            )?)
+            .set_inputs(
+                [input_selection_cell.clone(), input_omni_cell.clone()]
+                    .iter()
+                    .map(cell_to_cell_input)
+                    .collect(),
+            )
             .set_outputs(vec![
-                input_selection_cell.cell_output,
-                input_omni_cell.cell_output,
+                input_selection_cell.output.into(),
+                input_omni_cell.output.into(),
                 acp_cell,
             ])
             .set_outputs_data(vec![Default::default(), omni_data.pack(), acp_data.pack()])
@@ -382,7 +371,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 ctx.clone(),
                 &tx_view,
                 FeeRate(DEFAULT_FEE_RATE),
-                Some(payload.admin_id.try_into().unwrap()),
+                Some(payload.fee_payer.try_into().unwrap()),
                 None,
             )
             .await?;
