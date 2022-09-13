@@ -211,7 +211,7 @@ pub struct IssueAssetPayload {
 pub struct CrossChainTransferPayload {
     pub sender: String,
     pub receiver: String,
-    pub udt_hash: H256,
+    pub token_type_args: Bytes,
     pub amount: String,
     pub direction: u8,
     pub memo: H160,

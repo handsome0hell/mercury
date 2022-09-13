@@ -183,7 +183,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
 
     pub(crate) async fn inner_build_cross_chain_transfer_tx(
         &self,
-        ctx: Context,
+        _ctx: Context,
         payload: CrossChainTransferPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
         let sender = parse_address(&payload.sender)
@@ -192,70 +192,57 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .map_err(|e| CoreError::ParseAddressError(e.to_string()))?;
         let amount: u128 = payload.amount.parse().unwrap();
 
-        let input_user_cell = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![self
-                    .build_acp_cell(sender.payload().args())
-                    .calc_script_hash()
-                    .unpack()],
-                vec![payload.udt_hash.clone()],
-                None,
-                None,
-                Default::default(),
-            )
-            .await?
-            .response
-            .first()
+        let token_type = self
+            .builtin_scripts
+            .get(SUDT)
             .cloned()
-            .unwrap();
-        let input_relayer_cell = self
-            .get_live_cells(
-                ctx.clone(),
-                None,
-                vec![self
-                    .build_acp_cell(receiver.payload().args())
-                    .calc_script_hash()
-                    .unpack()],
-                vec![payload.udt_hash],
-                None,
-                None,
-                Default::default(),
-            )
-            .await?
-            .response
-            .first()
-            .cloned()
-            .unwrap();
-
-        let user_capacity: u64 = input_user_cell.cell_output.capacity().unpack();
-        let output_user_cell = input_user_cell
-            .cell_output
-            .clone()
+            .expect("get sudt type")
+            .script
             .as_builder()
-            .capacity((user_capacity - 1000).pack())
+            .args(payload.token_type_args.pack())
             .build();
+        let mut filter = SearchKeyFilter::default();
+        filter.script = Some(token_type.into());
+
+        let input_user_cell = self
+            .get_one_cell(SearchKey {
+                script: self.build_acp_cell(sender.payload().args()).into(),
+                script_type: ScriptType::Lock,
+                filter: Some(filter.clone()),
+            })?
+            .ok_or(CoreError::CannotFindCell(ACP.to_string()))?;
+
+        let input_relayer_cell = self
+            .get_one_cell(SearchKey {
+                script: self.build_acp_cell(receiver.payload().args()).into(),
+                script_type: ScriptType::Lock,
+                filter: Some(filter),
+            })?
+            .ok_or(CoreError::CannotFindCell(ACP.to_string()))?;
+
+        let user_capacity: u64 = input_user_cell.output.capacity.into();
+        let mut output_user_cell = input_user_cell.output.clone();
+        output_user_cell.capacity = (user_capacity - 1000).into();
         let user_sudt_amount = if payload.direction == 0 {
-            decode_udt_amount(&input_user_cell.cell_data)
+            decode_udt_amount(input_user_cell.output_data.as_bytes())
                 .unwrap()
                 .checked_add(amount)
                 .unwrap()
         } else {
-            decode_udt_amount(&input_user_cell.cell_data)
+            decode_udt_amount(input_user_cell.output_data.as_bytes())
                 .unwrap()
                 .checked_sub(amount)
                 .unwrap()
         };
         let output_user_cell_data = user_sudt_amount.to_le_bytes().to_vec();
-        let output_relayer_cell = input_relayer_cell.cell_output.clone();
+        let output_relayer_cell = input_relayer_cell.output.clone();
         let relayer_sudt_amount = if payload.direction == 0 {
-            decode_udt_amount(&input_relayer_cell.cell_data)
+            decode_udt_amount(input_relayer_cell.output_data.as_bytes())
                 .unwrap()
                 .checked_sub(amount)
                 .unwrap()
         } else {
-            decode_udt_amount(&input_relayer_cell.cell_data)
+            decode_udt_amount(input_relayer_cell.output_data.as_bytes())
                 .unwrap()
                 .checked_add(amount)
                 .unwrap()
@@ -271,12 +258,13 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             .clone();
 
         let tx_view = TransactionView::new_advanced_builder()
-            .set_inputs(self.build_transfer_tx_cell_inputs(
-                &[input_user_cell, input_relayer_cell],
-                None,
-                HashMap::default(),
-            )?)
-            .set_outputs(vec![output_relayer_cell, output_user_cell])
+            .set_inputs(
+                [input_user_cell, input_relayer_cell]
+                    .iter()
+                    .map(cell_to_cell_input)
+                    .collect(),
+            )
+            .set_outputs(vec![output_relayer_cell.into(), output_user_cell.into()])
             .set_outputs_data(vec![
                 output_relayer_cell_data.pack(),
                 output_user_cell_data.pack(),
