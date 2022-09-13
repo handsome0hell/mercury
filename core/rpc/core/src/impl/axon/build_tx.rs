@@ -409,11 +409,13 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
         payload: InitChainPayload,
     ) -> InnerResult<TransactionCompletionResponse> {
         let (omni_cell, omni_cell_data) =
-            self.build_omni_cell(payload.omni_config.clone(), payload.admin_id.clone())?;
-        let (checkpoint_cell, checkpoint_cell_data) = self
-            .build_checkpoint_cell(payload.check_point_config.clone(), payload.admin_id.clone())?;
+            self.build_omni_cell(payload.omni_config.clone(), payload.admin_identity.clone())?;
+        let (checkpoint_cell, checkpoint_cell_data) = self.build_checkpoint_cell(
+            payload.check_point_config.clone(),
+            payload.admin_identity.clone(),
+        )?;
         let (stake_cell, stake_cell_data) =
-            self.build_stake_cell(payload.state_config.clone(), payload.admin_id.clone())?;
+            self.build_stake_cell(payload.state_config.clone(), payload.admin_identity.clone())?;
         let selection_cell =
             self.build_selection_cell(checkpoint_cell.lock().calc_script_hash().unpack())?;
 
@@ -437,7 +439,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 ctx.clone(),
                 &tx_view,
                 FeeRate(DEFAULT_FEE_RATE),
-                Some(payload.admin_id.try_into().unwrap()),
+                Some(payload.admin_identity.try_into().unwrap()),
                 None,
             )
             .await?;

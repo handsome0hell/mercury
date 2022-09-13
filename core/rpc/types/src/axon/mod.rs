@@ -189,7 +189,7 @@ pub struct InitChainPayload {
     pub omni_config: OmniConfig,
     pub check_point_config: CheckpointConfig,
     pub state_config: StakeConfig,
-    pub admin_id: Identity,
+    pub admin_identity: Identity,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
