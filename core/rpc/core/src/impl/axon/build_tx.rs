@@ -17,9 +17,10 @@ use common::utils::{decode_udt_amount, parse_address, to_fixed_array};
 use common::TYPE_ID_CODE_HASH;
 use common::{Context, PaginationRequest, ACP, SECP256K1, SUDT};
 use core_ckb_client::CkbRpc;
+use core_rpc_types::axon::generated::{Byte8Reader, StakeInfoVecBuilder};
 use core_rpc_types::axon::{
     generated, unpack_byte16, BurnWithdrawalPayload, CrossChainTransferPayload, Identity,
-    InitChainPayload, IssueAssetPayload, StakeTokenPayload, SubmitCheckpointPayload,
+    InitChainPayload, IssueAssetPayload, StakeInfo, StakeTokenPayload, SubmitCheckpointPayload,
     UnlockWithdrawalPayload, UpdateCheckpointPayload, UpdateStakePayload, VerificationError,
     AXON_CHECKPOINT_LOCK, AXON_SELECTION_LOCK, AXON_STAKE_LOCK, AXON_WITHDRAW_LOCK,
 };
@@ -28,6 +29,7 @@ use core_rpc_types::TransactionCompletionResponse;
 
 use ckb_jsonrpc_types::{Script, ScriptHashType};
 
+use std::array::TryFromSliceError;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
@@ -37,6 +39,7 @@ struct ChainInfo {
     checkpoint_type_hash: Bytes,
     stake_type_hash: Bytes,
     period: u64,
+    era: u64,
 }
 
 impl<C: CkbRpc> MercuryRpcImpl<C> {
@@ -965,22 +968,96 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             admin_identity,
             checkpoint_cell,
             stake_type_hash,
+            era,
             ..
         } = self.get_chain_info_by_checkpoint_type_id_args(payload.checkpoint_type_id_args)?;
+        let amount = payload.amount.parse().unwrap();
 
         let input_stake_cell = self
             .get_one_cell_by_type_id_args(payload.stake_type_id_args)?
             .ok_or(CoreError::CannotFindCell(AXON_STAKE_LOCK.to_string()))?;
 
         let output_stake_cell = input_stake_cell.clone();
-        let output_stake_cell_data_builder =
+        let output_stake_cell_data_entity =
             generated::StakeLockCellData::from_slice(output_stake_cell.output_data.as_bytes())
-                .map_err(|e| CoreError::DecodeHexError(e.to_string()))?
-                .as_builder();
+                .map_err(|e| CoreError::DecodeHexError(e.to_string()))?;
+        let output_stake_cell_data_reader = output_stake_cell_data_entity.as_reader();
 
-        // TODO: modify stake infos
+        let quorum_size = u8::from_le_bytes(
+            output_stake_cell_data_reader
+                .quorum_size()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        );
 
-        let output_stake_cell_data = output_stake_cell_data_builder.build().as_bytes();
+        let stake_infos_entity = output_stake_cell_data_entity.stake_infos();
+        let stake_infos_reader = stake_infos_entity.as_reader();
+
+        let inauguration_era = era + 2;
+        let stake_infos = stake_infos_reader
+            .iter()
+            .enumerate()
+            .map(|(i, info)| -> Result<(usize, StakeInfo), String> {
+                let stake_info: StakeInfo = info.try_into()?;
+                Ok((i, stake_info))
+            })
+            .collect::<Result<Vec<(usize, StakeInfo)>, _>>()
+            .map_err(|e| CoreError::CommonError(e))?;
+
+        if stake_infos.iter().any(|(_i, info)| {
+            info.identity == payload.node_identity && info.inauguration_era == inauguration_era
+        }) {
+            return Err(CoreError::CommonError("Duplicate stake info".to_string()).into());
+        };
+
+        let usize_quorum_size = usize::from(quorum_size);
+        let mut working_stake_infos: Vec<&(usize, StakeInfo)> = stake_infos
+            .iter()
+            .filter(|(_i, info)| info.inauguration_era <= era)
+            .collect();
+        working_stake_infos.sort_by(|a, b| a.1.inauguration_era.cmp(&b.1.inauguration_era));
+        working_stake_infos.truncate(usize_quorum_size);
+
+        let mut prepared_stake_infos: Vec<&(usize, StakeInfo)> = stake_infos
+            .iter()
+            .filter(|(_i, info)| info.inauguration_era <= era + 1)
+            .collect();
+        prepared_stake_infos.sort_by(|a, b| a.1.inauguration_era.cmp(&b.1.inauguration_era));
+        prepared_stake_infos.truncate(usize_quorum_size);
+
+        let pending_stake_infos = stake_infos
+            .iter()
+            .filter(|(_i, info)| info.inauguration_era > era + 1);
+        if pending_stake_infos
+            .clone()
+            .nth(usize_quorum_size - 1)
+            .is_some()
+        {
+            return Err(CoreError::CommonError("Too many pending stake info".to_string()).into());
+        }
+
+        let mut new_stake_infos_index = working_stake_infos
+            .into_iter()
+            .chain(prepared_stake_infos)
+            .chain(pending_stake_infos)
+            .map(|(i, _v)| i)
+            .collect::<Vec<&usize>>();
+        new_stake_infos_index.sort();
+
+        let stake_infos_builder = StakeInfoVecBuilder::default().set(
+            new_stake_infos_index
+                .iter()
+                .map(|&&i| stake_infos_entity.get(i))
+                .collect::<Option<Vec<_>>>()
+                .unwrap(),
+        );
+
+        let output_stake_cell_data = output_stake_cell_data_entity
+            .as_builder()
+            .stake_infos(stake_infos_builder.build())
+            .build()
+            .as_bytes();
 
         // TODO: Load only once
         let token_type = self
@@ -1015,11 +1092,23 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             filter: Some(filter),
         })?;
 
+        let output_stake_token_cell_data = Bytes::copy_from_slice(
+            &all_stake_token_cells
+                .iter()
+                .fold(0u128, |sum, cell| {
+                    let amount = decode_udt_amount(cell.output_data.as_bytes()).unwrap();
+                    sum.checked_add(amount).unwrap()
+                })
+                .checked_add(amount)
+                .unwrap()
+                .to_le_bytes(),
+        );
+
         let (token_cells, excessed_amount) = self
             .get_udt_cells_by_identity(
                 ctx.clone(),
                 payload.node_identity.clone().try_into().unwrap(),
-                payload.amount.parse().unwrap(),
+                amount,
                 token_type.clone(),
             )
             .await?;
@@ -1049,6 +1138,13 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                 .build(),
         );
 
+        let mut outputs = vec![output_stake_cell.output.into(), output_acp_cell];
+        let mut outputs_data = vec![output_stake_cell_data.pack(), output_acp_data.pack()];
+        if all_stake_token_cells.len() != 0 {
+            outputs.push(all_stake_token_cells[0].output.clone().into());
+            outputs_data.push(output_stake_token_cell_data.pack());
+        }
+
         let tx_view = TransactionView::new_advanced_builder()
             .set_inputs(
                 [cell_to_cell_input(&input_stake_cell)]
@@ -1057,28 +1153,8 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
                     .chain(all_stake_token_cells.iter().map(cell_to_cell_input))
                     .collect(),
             )
-            .set_outputs(
-                [output_stake_cell.output.into()]
-                    .into_iter()
-                    .chain([output_acp_cell].into_iter())
-                    .chain(
-                        all_stake_token_cells
-                            .iter()
-                            .map(|c| c.output.clone().into()),
-                    )
-                    .collect(),
-            )
-            .set_outputs_data(
-                [output_stake_cell_data.pack()]
-                    .into_iter()
-                    .chain([output_acp_data.pack()].into_iter())
-                    .chain(
-                        all_stake_token_cells
-                            .iter()
-                            .map(|c| c.output_data.clone().into_bytes().pack()),
-                    )
-                    .collect(),
-            )
+            .set_outputs(outputs)
+            .set_outputs_data(outputs_data)
             .set_cell_deps(cell_deps)
             .build();
 
@@ -1122,13 +1198,9 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             Bytes::copy_from_slice(checkpoint_lock_args_reader.type_id_hash().as_slice());
         let admin_identity = checkpoint_lock_args_reader.admin_identity().into();
 
-        let period = u64::from_le_bytes(
-            checkpoint_cell_data_reader
-                .period()
-                .as_slice()
-                .try_into()
-                .unwrap(),
-        );
+        let period = from_byte8_reader(checkpoint_cell_data_reader.period()).unwrap();
+
+        let era = from_byte8_reader(checkpoint_cell_data_reader.era()).unwrap();
 
         Ok(ChainInfo {
             checkpoint_cell,
@@ -1136,6 +1208,7 @@ impl<C: CkbRpc> MercuryRpcImpl<C> {
             stake_type_hash,
             checkpoint_type_hash,
             period,
+            era,
         })
     }
 
@@ -1306,4 +1379,8 @@ fn build_bytes_opt(input: Bytes) -> Option<generated::Bytes> {
 }
 fn unpack_output_data_vec(outputs_data: packed::BytesVec) -> Vec<packed::Bytes> {
     outputs_data.into_iter().collect()
+}
+
+fn from_byte8_reader(reader: Byte8Reader) -> Result<u64, TryFromSliceError> {
+    Ok(u64::from_le_bytes(reader.as_slice().try_into()?))
 }

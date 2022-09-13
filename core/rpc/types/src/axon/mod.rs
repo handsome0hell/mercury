@@ -1,5 +1,7 @@
 pub mod generated;
 
+use std::array::TryFromSliceError;
+
 use ckb_types::{bytes::Bytes, packed, prelude::*, H160, H256};
 use common::utils::to_fixed_array;
 use serde::{Deserialize, Serialize};
@@ -97,6 +99,43 @@ pub struct StakeInfo {
     pub bls_pub_key: Bytes,
     pub stake_amount: String,
     pub inauguration_era: u64,
+}
+
+impl<'a> TryInto<StakeInfo> for generated::StakeInfoReader<'a> {
+    type Error = String;
+
+    fn try_into(self) -> Result<StakeInfo, Self::Error> {
+        let identity: Identity = self.identity().into();
+        let inauguration_era = u64::from_le_bytes(
+            self.inauguration_era()
+                .as_slice()
+                .try_into()
+                .map_err(|err: TryFromSliceError| err.to_string())?,
+        );
+
+        let bls_pub_key = Bytes::copy_from_slice(self.bls_pub_key().as_slice());
+
+        let stake_amount = u128::from_le_bytes(
+            self.stake_amount()
+                .as_slice()
+                .try_into()
+                .map_err(|err: TryFromSliceError| err.to_string())?,
+        )
+        .to_string();
+
+        let l2_address = H160(
+            <[u8; 20]>::try_from(self.l2_address().as_slice())
+                .map_err(|err: TryFromSliceError| err.to_string())?,
+        );
+
+        Ok(StakeInfo {
+            identity,
+            inauguration_era,
+            bls_pub_key,
+            stake_amount,
+            l2_address,
+        })
+    }
 }
 
 impl TryFrom<StakeInfo> for generated::StakeInfo {
